@@ -627,10 +627,12 @@ void ARDGameMode::SetupSpectatorCamera()
 	if (!Pawn) return;
 
 	Pawn->Tags.AddUnique(FName(TEXT("RD_Spectator")));
-	// High orbit over moonbase — see into corridors without roofs
-	const FVector CamLoc(12000.f, -5200.f, 5200.f);
+	// Front of base = WEST airlock facade. Camera sits west looking east into the fight.
+	const FVector CamLoc(1200.f, -5850.f, 2400.f);
+	const FVector LookAt(7500.f, -5850.f, 200.f); // airlock mouth + first corridors
 	Pawn->SetActorLocation(CamLoc, false, nullptr, ETeleportType::TeleportPhysics);
-	PC->SetControlRotation(FRotator(-58.f, 5.f, 0.f));
+	PC->SetControlRotation((LookAt - CamLoc).Rotation());
+	SpecOrbitYaw = 0.f;
 
 	if (ACharacter* Ch = Cast<ACharacter>(Pawn))
 	{
@@ -661,7 +663,7 @@ void ARDGameMode::SetupSpectatorCamera()
 	{
 		Leader->SetSpectatorInvulnerable(true);
 	}
-	UE_LOG(LogTemp, Log, TEXT("[RebelstarDelta] Spectator camera armed @ %s"), *CamLoc.ToCompactString());
+	UE_LOG(LogTemp, Log, TEXT("[RebelstarDelta] Spectator FRONT cam @ %s → airlock"), *CamLoc.ToCompactString());
 }
 
 void ARDGameMode::TickSpectatorCamera(float DeltaSeconds)
@@ -672,17 +674,49 @@ void ARDGameMode::TickSpectatorCamera(float DeltaSeconds)
 	APawn* Pawn = PC->GetPawn();
 	if (!Pawn) return;
 
-	// Slow orbit so agent / human can watch different corridors
-	SpecOrbitYaw += DeltaSeconds * 6.f;
-	const float Rad = FMath::DegreesToRadians(SpecOrbitYaw);
-	const FVector Center(13000.f, -4800.f, 0.f);
-	const float Radius = 6200.f;
-	const float Height = 4800.f + 400.f * FMath::Sin(SpecOrbitYaw * 0.05f);
-	const FVector CamLoc = Center + FVector(FMath::Cos(Rad) * Radius, FMath::Sin(Rad) * Radius, Height);
-	Pawn->SetActorLocation(CamLoc, false, nullptr, ETeleportType::TeleportPhysics);
+	// Hold a WEST→EAST “front of base” angle (airlock is the action).
+	// Gentle sway/dolly so the shot stays alive without spinning behind the base.
+	SpecOrbitYaw += DeltaSeconds;
 
-	const FVector LookAt = Center + FVector(0.f, 0.f, 120.f);
-	const FRotator LookRot = (LookAt - CamLoc).Rotation();
+	// Focus: airlock / west halls (combat approach). Nudge toward live units near the front.
+	FVector Focus(7000.f, -5850.f, 180.f);
+	int32 N = 0;
+	FVector Sum = FVector::ZeroVector;
+	TArray<AActor*> Bots;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDBot::StaticClass(), Bots);
+	for (AActor* A : Bots)
+	{
+		const ARDBot* B = Cast<ARDBot>(A);
+		if (!B || B->IsDead()) continue;
+		const FVector L = B->GetActorLocation();
+		// Only units near the western front / approach (not deep east ISAAC corner only)
+		if (L.X > -2000.f && L.X < 16000.f)
+		{
+			Sum += L;
+			++N;
+		}
+	}
+	if (N > 0)
+	{
+		const FVector Combat = Sum / float(N);
+		// Bias look toward combat but keep focus on front facade
+		Focus = FMath::Lerp(Focus, FVector(Combat.X, Combat.Y, 160.f), 0.55f);
+		Focus.X = FMath::Clamp(Focus.X, 4500.f, 12000.f);
+		Focus.Y = FMath::Clamp(Focus.Y, -8500.f, -2500.f);
+	}
+
+	const float SwayY = FMath::Sin(SpecOrbitYaw * 0.28f) * 900.f;
+	const float DollyX = FMath::Sin(SpecOrbitYaw * 0.18f) * 500.f;
+	const float BobZ = FMath::Sin(SpecOrbitYaw * 0.4f) * 180.f;
+
+	// Camera stays WEST of the wall (~X 5200), looking EAST at the front
+	const FVector CamLoc(
+		FMath::Clamp(800.f + DollyX, -500.f, 3200.f),
+		Focus.Y + SwayY * 0.35f - 200.f,
+		FMath::Clamp(2200.f + BobZ + (Focus.X - 5000.f) * 0.05f, 1600.f, 3600.f));
+
+	Pawn->SetActorLocation(CamLoc, false, nullptr, ETeleportType::TeleportPhysics);
+	const FRotator LookRot = (Focus + FVector(0.f, 0.f, 80.f) - CamLoc).Rotation();
 	PC->SetControlRotation(LookRot);
 }
 
