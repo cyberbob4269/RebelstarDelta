@@ -6,8 +6,10 @@ Saved/
 !Saved/AgentVision/
 Saved/AgentVision/*
 !Saved/AgentVision/training_series.csv
+!Saved/AgentVision/latest_round.json
 !Saved/AgentVision/battle_report_*.txt
 !Saved/AgentVision/*.md
+# Durable training copies live under Content/Data/Training (tracked)
 Build/
 .vs/
 *.sln

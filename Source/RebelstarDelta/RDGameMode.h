@@ -144,13 +144,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rebelstar|Spectator")
 	float AutoAlarmDelay = 1.5f;
 
-	/** Training series target (agent loop). 0 = unlimited. */
+	/** Training series target (agent loop). 0 = unlimited continuous soak. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rebelstar|Spectator")
-	int32 TargetTrainingRounds = 10;
+	int32 TargetTrainingRounds = 0;
 
-	/** Shorter matches while training so 20 rounds finish faster. */
+	/** Shorter matches while training so rematches generate denser data. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rebelstar|Spectator")
-	float TrainingMatchDuration = 75.f;
+	float TrainingMatchDuration = 70.f;
 
 	// --- Close-run roster (AI-vs-AI; map glyphs are a pool, not hard counts) ---
 	/** US human combatants (includes Trump). Default 4 → closer than 5v13. */
@@ -269,10 +269,12 @@ protected:
 	float AutoAlarmTimer = 0.f;
 	float RematchTimer = -1.f;
 	float MonitorLogTimer = 0.f;
-	float SpecOrbitYaw = 0.f;
-	/** Smooth camera follow of current US hero. */
+	/** Smooth cinematic follow of current US hero (no orbit bob). */
 	FVector SpecCamLoc = FVector::ZeroVector;
 	FVector SpecLookAt = FVector::ZeroVector;
+	FRotator SpecCamRot = FRotator::ZeroRotator;
+	FVector SpecSubjectLoc = FVector::ZeroVector;
+	FVector SpecSubjectFwd = FVector(1.f, 0.f, 0.f);
 	bool bSpecCamInitialized = false;
 	UPROPERTY()
 	TObjectPtr<ARDBot> SpectatorSubject;

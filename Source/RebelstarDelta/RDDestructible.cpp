@@ -46,6 +46,19 @@ void ARDDestructible::Configure(float InMaxHP, const FLinearColor& Color, const 
 		Mesh->SetStaticMesh(CubeMesh);
 		Mesh->SetWorldScale3D(Scale);
 	}
+	// Small furniture / plants: still shootable cover, but AI must not snag on them.
+	// Sealed doors / heavy machinery / tanks stay solid (breach objectives).
+	const bool bSolidObstacle =
+		InKind.Contains(TEXT("Sealed"), ESearchCase::IgnoreCase)
+		|| InKind.Contains(TEXT("door"), ESearchCase::IgnoreCase)
+		|| InKind.Contains(TEXT("Machinery"), ESearchCase::IgnoreCase)
+		|| InKind.Contains(TEXT("tank"), ESearchCase::IgnoreCase)
+		|| InKind.Contains(TEXT("Wall"), ESearchCase::IgnoreCase);
+	if (Mesh && !bSolidObstacle)
+	{
+		Mesh->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
+		Tags.Add(FName(TEXT("RD_Clutter")));
+	}
 	ApplyLook();
 }
 

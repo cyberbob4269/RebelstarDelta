@@ -29,8 +29,9 @@ protected:
 	bool LoadLogicRows(TArray<FString>& OutRows) const;
 	void ClearPrevious();
 	bool WantSeeThroughRoofs() const;
+	/** bBlockPawns=false → décor/clutter (bricks, poles) still visible but AI walks through. */
 	AActor* SpawnBox(const FVector& WorldLoc, const FVector& Scale, const FLinearColor& Color,
-		bool bCollision, bool bBreach = false, bool bUnlit = false);
+		bool bCollision, bool bBreach = false, bool bUnlit = false, bool bBlockPawns = true);
 	AActor* SpawnShape(UStaticMesh* Mesh, const FVector& WorldLoc, const FVector& Scale,
 		const FRotator& Rot, const FLinearColor& Color, bool bCollision, bool bUnlit = false);
 	void SpawnIsaacAt(const FVector& WorldLoc);
@@ -49,6 +50,8 @@ protected:
 	void FindWestEntrance(const TArray<FString>& Rows, int32& OutY, int32& OutWallX) const;
 	/** South breach into ISAAC sector (classic door choke). */
 	void FindIsaacDoorCell(const TArray<FString>& Rows, int32& OutX, int32& OutY) const;
+	/** Spawn NavMesh bounds + rebuild so engine pathfinding can work on greybox. */
+	void EnsureNavMesh();
 
 	UPROPERTY()
 	TObjectPtr<UStaticMesh> CubeMesh;

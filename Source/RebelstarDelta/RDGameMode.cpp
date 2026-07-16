@@ -35,16 +35,18 @@ ARDGameMode::ARDGameMode()
 void ARDGameMode::BeginPlay()
 {
 	Super::BeginPlay();
-	// Training series: shorter clocks so 20 rematches are practical
-	if (bAIVsAIMode && TargetTrainingRounds > 0)
+	// AI-vs-AI soak: short clocks, auto-rematch, dense training CSV
+	if (bAIVsAIMode)
 	{
 		MatchDuration = TrainingMatchDuration;
-		RematchDelay = FMath::Min(RematchDelay, 4.f);
-		AutoAlarmDelay = FMath::Min(AutoAlarmDelay, 1.5f);
+		RematchDelay = FMath::Min(RematchDelay, 3.5f);
+		AutoAlarmDelay = FMath::Min(AutoAlarmDelay, 1.2f);
 	}
 	TimeLeft = MatchDuration;
 	StatusMessage = bAIVsAIMode
-		? FString::Printf(TEXT("TRAINING series target %d — US(Trump) vs UK — roofs open"), TargetTrainingRounds)
+		? (TargetTrainingRounds > 0
+			? FString::Printf(TEXT("TRAINING target %d rds — US vs UK — roofs open"), TargetTrainingRounds)
+			: TEXT("TRAINING CONTINUOUS (unlimited) — data → Saved/AgentVision"))
 		: TEXT("Approach LZ — base is east. Tab=squad  1-4=orders");
 	bMatchOver = false;
 	bAttackersWin = false;
@@ -321,37 +323,70 @@ void ARDGameMode::SpawnSquadAndGuards()
 		}
 	}
 
-	// Attack team at far approach LZ (formation on open plain)
-	// Offsets in cm — spread so nothing stacks
-	const TArray<FVector> AllyOffsets = {
-		FVector(-250.f, -320.f, 0.f),
-		FVector(-400.f, 280.f, 0.f),
-		FVector(-550.f, -80.f, 0.f),
-		FVector(-700.f, 420.f, 0.f),
-		FVector(-850.f, -450.f, 0.f),
-		FVector(-1000.f, 150.f, 0.f),
-		FVector(-1150.f, -200.f, 0.f),
-		FVector(-1300.f, 350.f, 0.f),
-		FVector(-1450.f, -100.f, 0.f),
-		FVector(-1600.f, 250.f, 0.f),
+	// Attack team at far LZ — tactical wedge, unique slots (never UniqueID % 3)
+	// Slot: 0 point · 1/2 wings · 3/4 far flanks · 5/6 rear · 7 trail
+	auto SlotOffset = [](int32 Slot) -> FVector
+	{
+		static const FVector Offs[] = {
+			FVector(0.f, 0.f, 0.f),
+			FVector(-280.f, -700.f, 0.f),
+			FVector(-280.f, 700.f, 0.f),
+			FVector(-160.f, -1400.f, 0.f),
+			FVector(-160.f, 1400.f, 0.f),
+			FVector(-480.f, -380.f, 0.f),
+			FVector(-480.f, 380.f, 0.f),
+			FVector(-620.f, 0.f, 0.f),
+		};
+		return Offs[FMath::Clamp(Slot, 0, 7)];
 	};
-	int32 AllySlot = 0;
-	// Close-run: use Desired* caps (not full map glyph counts)
 	const int32 TrooperCount = CapAllyH;
 	const int32 RobotCount = CapAllyR;
-	for (int32 i = 0; i < TrooperCount; ++i)
+
+	TSet<int32> UsedSlots;
+	auto TakeSlot = [&](const TArray<int32>& Prefer) -> int32
 	{
-		const FString Nm = AllyNames.IsValidIndex(AllyNameI) ? AllyNames[AllyNameI++] : TEXT("Trooper");
-		const FVector Off = AllyOffsets.IsValidIndex(AllySlot) ? AllyOffsets[AllySlot] : FVector(-200.f * (i + 1), 0.f, 0.f);
-		++AllySlot;
-		if (SpawnUnit(ApproachLZ + Off, ERDBotTeam::Ally, ERDUnitRole::Trooper, Nm)) ++NAllyH;
-	}
+		for (int32 S : Prefer)
+		{
+			if (!UsedSlots.Contains(S))
+			{
+				UsedSlots.Add(S);
+				return S;
+			}
+		}
+		for (int32 S = 0; S < 8; ++S)
+		{
+			if (!UsedSlots.Contains(S))
+			{
+				UsedSlots.Add(S);
+				return S;
+			}
+		}
+		return 7;
+	};
+
+	// Robots take breach / rear armor slots first
+	const TArray<int32> RobotPrefer = { 0, 5, 6, 2 };
 	for (int32 i = 0; i < RobotCount; ++i)
 	{
 		const FString Nm = RobotNames.IsValidIndex(RobotNameI) ? RobotNames[RobotNameI++] : TEXT("ROBOT");
-		const FVector Off = AllyOffsets.IsValidIndex(AllySlot) ? AllyOffsets[AllySlot] : FVector(-200.f * (i + 4), 200.f, 0.f);
-		++AllySlot;
-		if (SpawnUnit(ApproachLZ + Off, ERDBotTeam::Ally, ERDUnitRole::AssaultRobot, Nm)) ++NAllyR;
+		const int32 Slot = TakeSlot(RobotPrefer);
+		if (ARDBot* B = SpawnUnit(ApproachLZ + SlotOffset(Slot), ERDBotTeam::Ally, ERDUnitRole::AssaultRobot, Nm))
+		{
+			B->SetFormationSlot(Slot);
+			++NAllyR;
+		}
+	}
+	// Humans fill wings and far flanks
+	const TArray<int32> HumanPrefer = { 1, 2, 3, 4, 5, 6, 7, 0 };
+	for (int32 i = 0; i < TrooperCount; ++i)
+	{
+		const FString Nm = AllyNames.IsValidIndex(AllyNameI) ? AllyNames[AllyNameI++] : TEXT("Trooper");
+		const int32 Slot = TakeSlot(HumanPrefer);
+		if (ARDBot* B = SpawnUnit(ApproachLZ + SlotOffset(Slot), ERDBotTeam::Ally, ERDUnitRole::Trooper, Nm))
+		{
+			B->SetFormationSlot(Slot);
+			++NAllyH;
+		}
 	}
 
 	// Player at LZ = TRUMP (leader). AI-vs-AI: spectator cam; FPS: first-person Trump.
@@ -515,18 +550,24 @@ FString ARDGameMode::GetDefenseName() const
 
 FVector ARDGameMode::GetApproachWaypoint(int32 FormationSlot) const
 {
-	const float Spread = (FormationSlot - 1) * 90.f;
+	// Wide lane table (cm) — matches ARDBot::GetFormationOffset laterals
+	static const float Lanes[] = { 0.f, -700.f, 700.f, -1400.f, 1400.f, -380.f, 380.f, 0.f };
+	const int32 i = FMath::Clamp(FormationSlot, 0, 7);
+	const float Lane = Lanes[i];
+	// Depth stagger so rear ranks do not pile on the door
+	static const float Depth[] = { 0.f, -200.f, -200.f, -80.f, -80.f, -420.f, -420.f, -560.f };
+	const float Dx = Depth[i];
 	switch (CurrentApproach)
 	{
 	case ERDApproachRoute::NorthFlank:
 		// Northern open approach then east into base
-		return FVector(5400.f, -7600.f + Spread, 120.f);
+		return FVector(5400.f + Dx, -7600.f + Lane * 0.55f, 120.f);
 	case ERDApproachRoute::SouthFlank:
 		// Southern / workshop-side approach
-		return FVector(5400.f, -3800.f + Spread, 120.f);
+		return FVector(5400.f + Dx, -3800.f + Lane * 0.55f, 120.f);
 	default:
-		// Classic P-row airlock mouth
-		return FVector(5300.f, -5850.f + Spread * 0.7f, 120.f);
+		// Classic P-row airlock — each body on own Y corridor (~7–14 m apart)
+		return FVector(5300.f + Dx, -5850.f + Lane, 120.f);
 	}
 }
 
@@ -630,14 +671,16 @@ void ARDGameMode::SetupSpectatorCamera()
 	SpectatorSubject = nullptr;
 	LastSpectatorSubjectName.Reset();
 	bSpecCamInitialized = false;
-	SpecOrbitYaw = 0.f;
 
-	// Seed camera behind Trump (or LZ) looking toward the base front
+	// Seed camera behind Trump (or LZ) looking toward the base front — stable, no orbit
 	const FVector SeedSubject(-9000.f, -5850.f, 120.f);
-	SpecLookAt = SeedSubject + FVector(1200.f, 0.f, 80.f);
-	SpecCamLoc = SeedSubject + FVector(-900.f, -420.f, 520.f);
+	SpecSubjectLoc = SeedSubject;
+	SpecSubjectFwd = FVector(1.f, 0.f, 0.f);
+	SpecLookAt = SeedSubject + FVector(1400.f, 0.f, 100.f);
+	SpecCamLoc = SeedSubject + FVector(-820.f, -360.f, 420.f);
+	SpecCamRot = (SpecLookAt - SpecCamLoc).Rotation();
 	Pawn->SetActorLocation(SpecCamLoc, false, nullptr, ETeleportType::TeleportPhysics);
-	PC->SetControlRotation((SpecLookAt - SpecCamLoc).Rotation());
+	PC->SetControlRotation(SpecCamRot);
 
 	if (ACharacter* Ch = Cast<ACharacter>(Pawn))
 	{
@@ -729,8 +772,6 @@ void ARDGameMode::TickSpectatorCamera(float DeltaSeconds)
 	APawn* Pawn = PC->GetPawn();
 	if (!Pawn) return;
 
-	SpecOrbitYaw += DeltaSeconds;
-
 	ARDBot* Sub = ResolveSpectatorSubject();
 	if (Sub && Sub != SpectatorSubject.Get())
 	{
@@ -749,63 +790,91 @@ void ARDGameMode::TickSpectatorCamera(float DeltaSeconds)
 		LastSpectatorSubjectName = Sub->UnitName;
 	}
 
-	// Subject position (fallback: airlock approach)
-	FVector SubjectLoc(-9000.f, -5850.f, 120.f);
-	FVector SubjectFwd = FVector(1.f, 0.f, 0.f); // toward base
+	// Raw subject (fallback: approach LZ)
+	FVector RawLoc(-9000.f, -5850.f, 120.f);
+	FVector RawFwd = FVector(1.f, 0.f, 0.f); // toward base
 	if (IsValid(Sub) && !Sub->IsDead())
 	{
-		SubjectLoc = Sub->GetActorLocation();
-		SubjectFwd = Sub->GetActorForwardVector();
-		SubjectFwd.Z = 0.f;
-		if (SubjectFwd.IsNearlyZero()) SubjectFwd = FVector(1.f, 0.f, 0.f);
-		else SubjectFwd.Normalize();
+		RawLoc = Sub->GetActorLocation();
+		// Prefer travel / base direction over twitchy face heading
+		FVector Face = Sub->GetActorForwardVector();
+		Face.Z = 0.f;
+		if (!Face.IsNearlyZero()) Face.Normalize();
+		else Face = FVector(1.f, 0.f, 0.f);
+		// Blend face with +X (assault axis) so camera does not whip when they spin
+		RawFwd = (Face * 0.35f + FVector(1.f, 0.f, 0.f) * 0.65f).GetSafeNormal();
+	}
+	RawLoc.Z = FMath::Clamp(RawLoc.Z, 100.f, 180.f);
+
+	if (!bSpecCamInitialized)
+	{
+		SpecSubjectLoc = RawLoc;
+		SpecSubjectFwd = RawFwd;
+	}
+	else
+	{
+		// Heavy lag on subject — absorbs unstick hops and steer thrash
+		SpecSubjectLoc = FMath::VInterpTo(SpecSubjectLoc, RawLoc, DeltaSeconds, 3.2f);
+		SpecSubjectFwd = FMath::VInterpTo(SpecSubjectFwd, RawFwd, DeltaSeconds, 2.4f).GetSafeNormal();
+		if (SpecSubjectFwd.IsNearlyZero()) SpecSubjectFwd = FVector(1.f, 0.f, 0.f);
 	}
 
-	// Look a bit ahead of the hero (toward base / their aim) so action is in frame
-	FVector Ahead = SubjectLoc + SubjectFwd * 900.f + FVector(0.f, 0.f, 80.f);
-	// Also bias look toward nearest enemy so fights read clearly
+	// Look mostly ahead along smoothed travel — soft enemy bias only when close & stable
+	FVector Ahead = SpecSubjectLoc + SpecSubjectFwd * 1100.f + FVector(400.f, 0.f, 90.f);
 	if (IsValid(Sub))
 	{
 		TArray<AActor*> Bots;
 		UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDBot::StaticClass(), Bots);
-		float BestD = 2800.f;
+		float BestD = 1600.f;
+		FVector EnemyPt = Ahead;
+		bool bFound = false;
 		for (AActor* A : Bots)
 		{
 			const ARDBot* E = Cast<ARDBot>(A);
 			if (!E || E->IsDead() || E->Team != ERDBotTeam::Defender) continue;
-			const float D = FVector::Dist(SubjectLoc, E->GetActorLocation());
+			const float D = FVector::Dist(SpecSubjectLoc, E->GetActorLocation());
 			if (D < BestD)
 			{
 				BestD = D;
-				Ahead = FMath::Lerp(Ahead, E->GetActorLocation() + FVector(0.f, 0.f, 70.f), 0.65f);
+				EnemyPt = E->GetActorLocation() + FVector(0.f, 0.f, 70.f);
+				bFound = true;
 			}
 		}
+		// Mild pull only — was 0.65 and caused fight-whip dizziness
+		if (bFound) Ahead = FMath::Lerp(Ahead, EnemyPt, 0.22f);
 	}
 
-	// Camera: over-the-shoulder behind hero, slightly elevated, facing action / base
-	const FVector Right = FVector::CrossProduct(SubjectFwd, FVector::UpVector).GetSafeNormal();
-	const float Shoulder = 280.f + 40.f * FMath::Sin(SpecOrbitYaw * 0.7f);
-	const float Back = 720.f + 60.f * FMath::Sin(SpecOrbitYaw * 0.35f);
-	const float Height = 380.f + 40.f * FMath::Sin(SpecOrbitYaw * 0.5f);
-	const FVector DesiredCam = SubjectLoc - SubjectFwd * Back + Right * Shoulder + FVector(0.f, 0.f, Height);
+	// Fixed over-the-shoulder rig (NO sine orbit — that made people dizzy)
+	const FVector Right = FVector::CrossProduct(SpecSubjectFwd, FVector::UpVector).GetSafeNormal();
+	const float Shoulder = 300.f;
+	const float Back = 780.f;
+	const float Height = 400.f;
+	const FVector DesiredCam = SpecSubjectLoc - SpecSubjectFwd * Back + Right * Shoulder + FVector(0.f, 0.f, Height);
 	const FVector DesiredLook = Ahead;
 
 	if (!bSpecCamInitialized)
 	{
 		SpecCamLoc = DesiredCam;
 		SpecLookAt = DesiredLook;
+		SpecCamRot = (SpecLookAt - SpecCamLoc).Rotation();
 		bSpecCamInitialized = true;
 	}
 	else
 	{
-		const float CamSpeed = 6.5f;
-		const float LookSpeed = 8.f;
-		SpecCamLoc = FMath::VInterpTo(SpecCamLoc, DesiredCam, DeltaSeconds, CamSpeed);
-		SpecLookAt = FMath::VInterpTo(SpecLookAt, DesiredLook, DeltaSeconds, LookSpeed);
+		// Cinematic lag — lower = smoother, less motion sickness
+		SpecCamLoc = FMath::VInterpTo(SpecCamLoc, DesiredCam, DeltaSeconds, 2.6f);
+		SpecLookAt = FMath::VInterpTo(SpecLookAt, DesiredLook, DeltaSeconds, 2.8f);
 	}
 
+	FRotator DesiredRot = (SpecLookAt - SpecCamLoc).Rotation();
+	// Clamp pitch so look never snaps sky/ground
+	DesiredRot.Pitch = FMath::Clamp(DesiredRot.Pitch, -25.f, 8.f);
+	DesiredRot.Roll = 0.f;
+	SpecCamRot = FMath::RInterpTo(SpecCamRot, DesiredRot, DeltaSeconds, 2.5f);
+	SpecCamRot.Roll = 0.f;
+
 	Pawn->SetActorLocation(SpecCamLoc, false, nullptr, ETeleportType::TeleportPhysics);
-	PC->SetControlRotation((SpecLookAt - SpecCamLoc).Rotation());
+	PC->SetControlRotation(SpecCamRot);
 }
 
 void ARDGameMode::TickBattleMonitor(float DeltaSeconds)
@@ -1064,17 +1133,25 @@ void ARDGameMode::EndMatch(bool bWin, const FString& Message)
 
 	if (bAIVsAIMode)
 	{
-		// Analyze may set RematchTimer < 0 when training series is complete
-		if (RematchTimer >= 0.f || (TargetTrainingRounds > 0 && RoundIndex < TargetTrainingRounds))
+		// Continuous soak: TargetTrainingRounds==0 → always rematch
+		// Finite series: rematch while RoundIndex < target (Analyze may stop after last)
+		const bool bUnlimited = (TargetTrainingRounds <= 0);
+		const bool bSeriesOpen = bUnlimited || (RoundIndex < TargetTrainingRounds);
+		if (bSeriesOpen && RematchTimer >= -0.5f) // -1 means "stop series" from Analyze
 		{
-			if (TargetTrainingRounds <= 0 || RoundIndex < TargetTrainingRounds)
-			{
-				RematchTimer = RematchDelay;
-			}
-			else
+			// If Analyze set RematchTimer to -1 for completion, honour it
+			if (TargetTrainingRounds > 0 && RoundIndex >= TargetTrainingRounds)
 			{
 				RematchTimer = -1.f;
 			}
+			else
+			{
+				RematchTimer = RematchDelay;
+			}
+		}
+		else if (bUnlimited)
+		{
+			RematchTimer = RematchDelay;
 		}
 		// Skip long cinematic in spectator loop — quick scoreboard then rematch
 		bEndingCinematic = false;
@@ -1267,21 +1344,47 @@ void ARDGameMode::AnalyzeBattleAndLearn(bool bWin, const FString& Message)
 	const FString Path = Dir / FString::Printf(TEXT("battle_report_R%d.txt"), RoundIndex);
 	FFileHelper::SaveStringToFile(Report, *Path);
 
+	const FString Ts = FDateTime::Now().ToString(TEXT("%Y-%m-%d_%H-%M-%S"));
 	const FString CsvLine = FString::Printf(
-		TEXT("%d,%s,%s,%s,%d,%d,%d,%d,%d,%d,%.0f,%d,%.3f,%.3f,%.3f,%.3f\n"),
-		RoundIndex, bWin ? TEXT("US") : TEXT("UK"),
+		TEXT("%s,%d,%s,%s,%s,%d,%d,%d,%d,%d,%d,%.0f,%.0f,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d\n"),
+		*Ts, RoundIndex, bWin ? TEXT("US") : TEXT("UK"),
 		*GetApproachName(), *GetDefenseName(),
 		Allies, Defs, AttackerKills, DefenderKills,
 		bIsaacDoorBreached ? 1 : 0, GetIsaacAliveCount(),
-		MaxAllyX, TotalStuck,
-		LearnedAllySpeedMul, LearnedAllyDamageMul, LearnedAllyFireMul, LearnedDefFireMul);
+		MaxAllyX, AvgAllyX, TotalStuck,
+		LearnedAllySpeedMul, LearnedAllyDamageMul, LearnedAllyFireMul, LearnedDefFireMul, LearnedDefSpeedMul,
+		AttackerWins, DefenderWins);
 	const FString SeriesPath = Dir / TEXT("training_series.csv");
 	if (!FPaths::FileExists(SeriesPath))
 	{
 		FFileHelper::SaveStringToFile(
-			TEXT("round,winner,usRoute,ukPlan,aliveA,aliveD,kA,kD,door,isaac,peakX,stuck,spd,dmg,fire,defFire\n"), *SeriesPath);
+			TEXT("ts,round,winner,usRoute,ukPlan,aliveA,aliveD,kA,kD,door,isaac,peakX,avgX,stuck,spd,dmg,fire,defFire,defSpd,winsUS,winsUK\n"),
+			*SeriesPath);
 	}
 	FFileHelper::SaveStringToFile(CsvLine, *SeriesPath, FFileHelper::EEncodingOptions::AutoDetect, &IFileManager::Get(), EFileWrite::FILEWRITE_Append);
+
+	// Rolling latest snapshot for external tools / agents (overwrite each round)
+	const FString Snapshot = FString::Printf(
+		TEXT("{\n  \"ts\": \"%s\",\n  \"round\": %d,\n  \"winner\": \"%s\",\n  \"usRoute\": \"%s\",\n  \"ukPlan\": \"%s\",\n  \"aliveA\": %d,\n  \"aliveD\": %d,\n  \"killsA\": %d,\n  \"killsD\": %d,\n  \"door\": %d,\n  \"isaacAlive\": %d,\n  \"peakX\": %.0f,\n  \"stuck\": %d,\n  \"learnSpd\": %.3f,\n  \"learnDmg\": %.3f,\n  \"winsUS\": %d,\n  \"winsUK\": %d\n}\n"),
+		*Ts, RoundIndex, bWin ? TEXT("US") : TEXT("UK"),
+		*GetApproachName(), *GetDefenseName(),
+		Allies, Defs, AttackerKills, DefenderKills,
+		bIsaacDoorBreached ? 1 : 0, GetIsaacAliveCount(), MaxAllyX, TotalStuck,
+		LearnedAllySpeedMul, LearnedAllyDamageMul, AttackerWins, DefenderWins);
+	FFileHelper::SaveStringToFile(Snapshot, *(Dir / TEXT("latest_round.json")));
+
+	// Also append to a durable project-relative copy (survives some Saved/ cleans)
+	const FString DurableDir = FPaths::ProjectDir() / TEXT("Content/Data/Training");
+	IFileManager::Get().MakeDirectory(*DurableDir, true);
+	const FString DurableCsv = DurableDir / TEXT("training_series.csv");
+	if (!FPaths::FileExists(DurableCsv))
+	{
+		FFileHelper::SaveStringToFile(
+			TEXT("ts,round,winner,usRoute,ukPlan,aliveA,aliveD,kA,kD,door,isaac,peakX,avgX,stuck,spd,dmg,fire,defFire,defSpd,winsUS,winsUK\n"),
+			*DurableCsv);
+	}
+	FFileHelper::SaveStringToFile(CsvLine, *DurableCsv, FFileHelper::EEncodingOptions::AutoDetect, &IFileManager::Get(), EFileWrite::FILEWRITE_Append);
+	FFileHelper::SaveStringToFile(Snapshot, *(DurableDir / TEXT("latest_round.json")));
 
 	if (TargetTrainingRounds > 0 && RoundIndex >= TargetTrainingRounds)
 	{
@@ -1290,6 +1393,12 @@ void ARDGameMode::AnalyzeBattleAndLearn(bool bWin, const FString& Message)
 		StatusMessage = FString::Printf(TEXT("TRAINING DONE %d rds — US %d UK %d"), TargetTrainingRounds, AttackerWins, DefenderWins);
 		// Stop auto rematch after target
 		RematchTimer = -1.f;
+	}
+	else if (TargetTrainingRounds <= 0)
+	{
+		// Continuous soak — always rematch
+		UE_LOG(LogTemp, Log, TEXT("[RebelstarDelta] CONTINUOUS R%d done — series US %d / UK %d — data logged"),
+			RoundIndex, AttackerWins, DefenderWins);
 	}
 }
 

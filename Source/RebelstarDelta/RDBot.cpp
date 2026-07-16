@@ -2,6 +2,7 @@
 
 #include "RDBot.h"
 #include "RDCharacter.h"
+#include "RDDestructible.h"
 #include "RDGameMode.h"
 #include "RDIsaacNode.h"
 #include "RDLaserFX.h"
@@ -14,13 +15,16 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "NavigationPath.h"
+#include "NavigationSystem.h"
 #include "UObject/ConstructorHelpers.h"
 
 ARDBot::ARDBot()
 {
 	PrimaryActorTick.bCanEverTick = true;
 
-	GetCapsuleComponent()->InitCapsuleSize(55.f, 96.f);
+	// Slimmer default capsule — greybox corners + props snag fat capsules hard
+	GetCapsuleComponent()->InitCapsuleSize(42.f, 90.f);
 	// Pawn channel so lasers hit reliably
 	GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	GetCapsuleComponent()->SetCollisionObjectType(ECC_Pawn);
@@ -28,11 +32,24 @@ ARDBot::ARDBot()
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
 	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
 
-	GetCharacterMovement()->MaxWalkSpeed = 520.f;
-	GetCharacterMovement()->GravityScale = 0.16f;
-	GetCharacterMovement()->bOrientRotationToMovement = false;
-	GetCharacterMovement()->BrakingDecelerationWalking = 3000.f;
-	GetCharacterMovement()->GroundFriction = 8.f;
+	// Off-the-shelf UE crowd anti-collision: Reciprocal Velocity Obstacles (RVO)
+	// on CharacterMovement — same system Detour Crowd / AI MoveTo uses.
+	// Requires RequestDirectMove (not raw SetActorLocation) so avoidance runs.
+	UCharacterMovementComponent* Move = GetCharacterMovement();
+	Move->MaxWalkSpeed = 780.f;
+	Move->MaxFlySpeed = 780.f;
+	Move->MaxAcceleration = 12000.f;
+	Move->GravityScale = 0.f; // free XY on lunar greybox; we stabilize Z
+	Move->bOrientRotationToMovement = false;
+	Move->BrakingDecelerationWalking = 2000.f;
+	Move->BrakingDecelerationFlying = 1800.f; // was 3200 — over-braked every frame
+	Move->GroundFriction = 8.f;
+	Move->MaxStepHeight = 55.f;
+	Move->SetWalkableFloorAngle(50.f);
+	Move->DefaultLandMovementMode = MOVE_Flying;
+	Move->bUseRVOAvoidance = true;
+	Move->AvoidanceConsiderationRadius = 320.f; // tighter so RVO doesn't glue packs
+	Move->AvoidanceWeight = 0.35f;
 	bUseControllerRotationYaw = false;
 	AutoPossessAI = EAutoPossessAI::Disabled;
 
@@ -114,12 +131,12 @@ void ARDBot::ConfigureFromRole(ERDUnitRole InRole, ERDBotTeam InTeam, const FStr
 		bIsRobot = true;
 		bFemaleSuit = false;
 		MaxHP = 220.f;
-		MoveSpeed = 320.f;   // 2D: 80 vs human 130 → ~62% of human
+		MoveSpeed = 560.f;   // was 320 — felt crawl; robots still slower than humans
 		ShotDamage = 34.f;
 		FireInterval = 0.9f;
 		WeaponRange = 2400.f;
 		SightRange = 2200.f;
-		GetCapsuleComponent()->InitCapsuleSize(62.f, 100.f);
+		GetCapsuleComponent()->InitCapsuleSize(48.f, 96.f);
 		break;
 	default:
 		bIsRobot = false;
@@ -127,7 +144,7 @@ void ARDBot::ConfigureFromRole(ERDUnitRole InRole, ERDBotTeam InTeam, const FStr
 			|| UnitName.Contains(TEXT("May")) || UnitName.Contains(TEXT("Badenoch"))
 			|| UnitName.Contains(TEXT("Braverman"));
 		MaxHP = bLeaderSuit ? 90.f : 60.f;
-		MoveSpeed = bLeaderSuit ? 540.f : 520.f;
+		MoveSpeed = bLeaderSuit ? 820.f : 760.f; // assault pace for greybox distances
 		ShotDamage = bLeaderSuit ? 22.f : 16.f;
 		FireInterval = bLeaderSuit ? 0.4f : 0.5f;
 		WeaponRange = 2800.f;
@@ -138,7 +155,11 @@ void ARDBot::ConfigureFromRole(ERDUnitRole InRole, ERDBotTeam InTeam, const FStr
 
 	bHoldPost = (InRole == ERDUnitRole::SentryDroid);
 	HP = MaxHP;
-	GetCharacterMovement()->MaxWalkSpeed = MoveSpeed;
+	if (UCharacterMovementComponent* Mov = GetCharacterMovement())
+	{
+		Mov->MaxWalkSpeed = MoveSpeed;
+		Mov->MaxFlySpeed = MoveSpeed;
+	}
 	if (bIsRobot)
 	{
 		Tags.Add(FName(TEXT("RD_Robot")));
@@ -155,6 +176,7 @@ void ARDBot::ApplyLearningBoost(float SpeedMul, float DamageMul, float FireRateM
 	if (UCharacterMovementComponent* Mov = GetCharacterMovement())
 	{
 		Mov->MaxWalkSpeed = MoveSpeed;
+		Mov->MaxFlySpeed = MoveSpeed;
 	}
 }
 
@@ -359,10 +381,145 @@ void ARDBot::BeginPlay()
 	HoldPoint = Home;
 	WanderTarget = Home;
 	LastPos = Home;
-	FormationSlot = GetUniqueID() % 3;
-	GetCharacterMovement()->MaxWalkSpeed = MoveSpeed;
+	// FormationSlot is assigned by GameMode at spawn (unique 0..N). Do not collapse to % 3.
+	PreferDetourSign = (GetFormationLaneY() >= 0.f) ? 1.f : -1.f;
+	if (UCharacterMovementComponent* Move = GetCharacterMovement())
+	{
+		Move->MaxWalkSpeed = MoveSpeed;
+		Move->MaxFlySpeed = MoveSpeed;
+		Move->SetMovementMode(MOVE_Flying);
+		// Engine RVO: agents push sideways around each other instead of stacking
+		Move->bUseRVOAvoidance = true;
+		Move->SetAvoidanceEnabled(true);
+		Move->AvoidanceConsiderationRadius = bIsRobot ? 480.f : 400.f;
+		Move->AvoidanceWeight = bIsRobot ? 0.65f : 0.45f; // robots less yielding
+		// Ally group 1, defenders group 2 — both avoid each other
+		const int32 Group = (Team == ERDBotTeam::Ally) ? 1 : 2;
+		Move->SetAvoidanceGroup(Group);
+		Move->SetGroupsToAvoid(1 | 2);
+		Move->SetGroupsToIgnore(0);
+	}
 	BuildSuit();
 	RefreshLook();
+}
+
+void ARDBot::SetFormationSlot(int32 Slot)
+{
+	FormationSlot = FMath::Max(0, Slot);
+	PreferDetourSign = (GetFormationLaneY() >= 0.f) ? 1.f : -1.f;
+}
+
+FVector ARDBot::GetFormationOffset() const
+{
+	// Depth (negative X = behind point), lateral Y — meters of air between bodies
+	struct FLane { float Back; float Side; };
+	static const FLane Table[] = {
+		{ 0.f, 0.f },         // 0 point / breach
+		{ 280.f, -700.f },    // 1 left wing
+		{ 280.f, 700.f },     // 2 right wing
+		{ 160.f, -1400.f },   // 3 far left flank
+		{ 160.f, 1400.f },    // 4 far right flank
+		{ 480.f, -380.f },    // 5 rear left
+		{ 480.f, 380.f },     // 6 rear right
+		{ 620.f, 0.f },       // 7 trail center
+	};
+	const int32 i = FMath::Clamp(FormationSlot, 0, 7);
+	return FVector(-Table[i].Back, Table[i].Side, 0.f);
+}
+
+float ARDBot::GetFormationLaneY() const
+{
+	return GetFormationOffset().Y;
+}
+
+FVector ARDBot::GetChokeStagingPoint(const FVector& ChokeLoc, float BackDist) const
+{
+	const FVector Off = GetFormationOffset();
+	// Hold west of choke on own lateral lane — never all at same XY
+	return FVector(ChokeLoc.X - BackDist + Off.X * 0.35f, ChokeLoc.Y + Off.Y, 120.f);
+}
+
+void ARDBot::BashNearestObstacle()
+{
+	if (!GetWorld() || FireCD > 0.1f) return;
+	AActor* Best = nullptr;
+	float BestD = 280.f;
+	// Prefer room door / wreck / destructible in face
+	if (AActor* D = FindNearestRoomDoor())
+	{
+		const float Dist = FVector::Dist(GetActorLocation(), D->GetActorLocation());
+		if (Dist < BestD) { BestD = Dist; Best = D; }
+	}
+	if (AActor* P = FindNearestBreachable())
+	{
+		const float Dist = FVector::Dist(GetActorLocation(), P->GetActorLocation());
+		if (Dist < BestD) { BestD = Dist; Best = P; }
+	}
+	TArray<AActor*> Props;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDDestructible::StaticClass(), Props);
+	for (AActor* A : Props)
+	{
+		if (!A) continue;
+		const float Dist = FVector::Dist(GetActorLocation(), A->GetActorLocation());
+		if (Dist < BestD) { BestD = Dist; Best = A; }
+	}
+	if (Best)
+	{
+		TryBreachTarget(Best, 2.6f);
+	}
+}
+
+FVector ARDBot::FindBestSteerDir(const FVector& DesiredDir, float LookAhead) const
+{
+	UWorld* World = GetWorld();
+	if (!World || DesiredDir.IsNearlyZero()) return DesiredDir;
+
+	const float Rad = GetCapsuleComponent() ? GetCapsuleComponent()->GetScaledCapsuleRadius() * 0.78f : 36.f;
+	const float Half = GetCapsuleComponent() ? GetCapsuleComponent()->GetScaledCapsuleHalfHeight() * 0.5f : 48.f;
+	const FVector Origin = GetActorLocation();
+	FVector Base = DesiredDir.GetSafeNormal2D();
+	if (Base.IsNearlyZero()) Base = GetActorForwardVector().GetSafeNormal2D();
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(RDSteer), false, this);
+	TArray<AActor*> Bots;
+	UGameplayStatics::GetAllActorsOfClass(World, ARDBot::StaticClass(), Bots);
+	for (AActor* ABot : Bots)
+	{
+		if (ABot && ABot != this) Params.AddIgnoredActor(ABot);
+	}
+	const FCollisionShape Cap = FCollisionShape::MakeCapsule(Rad, Half);
+
+	// Prefer goal angle, then sticky detour side, then opposite
+	const float Prefer = PreferDetourSign;
+	const float Angles[] = {
+		0.f, 22.f * Prefer, -22.f * Prefer, 45.f * Prefer, -45.f * Prefer,
+		70.f * Prefer, -70.f * Prefer, 100.f * Prefer, -100.f * Prefer,
+		135.f * Prefer, -135.f * Prefer, 180.f
+	};
+
+	FVector BestDir = Base;
+	float BestScore = -1.e9f;
+	for (float Deg : Angles)
+	{
+		const float RadA = FMath::DegreesToRadians(Deg);
+		const FVector Dir(
+			Base.X * FMath::Cos(RadA) - Base.Y * FMath::Sin(RadA),
+			Base.X * FMath::Sin(RadA) + Base.Y * FMath::Cos(RadA),
+			0.f);
+		const FVector End = Origin + Dir * LookAhead;
+		FHitResult Hit;
+		const bool bHit = World->SweepSingleByChannel(Hit, Origin, End, FQuat::Identity, ECC_Pawn, Cap, Params);
+		const float Free = (!bHit || !Hit.bBlockingHit) ? LookAhead : Hit.Distance;
+		if (Free < Rad * 1.1f) continue;
+		const float Align = FVector::DotProduct(Dir, Base);
+		const float Score = Free * 1.6f + Align * 140.f - FMath::Abs(Deg) * 0.35f;
+		if (Score > BestScore)
+		{
+			BestScore = Score;
+			BestDir = Dir;
+		}
+	}
+	return BestDir.GetSafeNormal2D();
 }
 
 void ARDBot::TickStuckRecovery(float DeltaSeconds)
@@ -378,49 +535,70 @@ void ARDBot::TickStuckRecovery(float DeltaSeconds)
 
 	const FVector Now = GetActorLocation();
 	const float Moved = FVector::Dist2D(Now, LastPos);
-	if (Moved < 8.f)
+	if (Moved < 6.f)
 	{
 		StuckT += DeltaSeconds;
 	}
 	else
 	{
-		StuckT = 0.f;
+		StuckT = FMath::Max(0.f, StuckT - DeltaSeconds * 1.5f);
 	}
 	LastPos = Now;
 
 	if (UnstickT > 0.f)
 	{
 		UnstickT -= DeltaSeconds;
-		const FVector Nudge = UnstickDir * MoveSpeed * 1.4f * DeltaSeconds;
-		SetActorLocation(Now + FVector(Nudge.X, Nudge.Y, 0.f), false);
+		// Gentle slide via CMC so RVO still runs (no teleport hop)
+		if (UCharacterMovementComponent* Move = GetCharacterMovement())
+		{
+			Move->RequestDirectMove(UnstickDir * MoveSpeed * 0.9f, false);
+		}
+		else
+		{
+			FVector Nudge = Now + UnstickDir * MoveSpeed * 0.85f * DeltaSeconds;
+			Nudge.Z = FMath::Clamp(Now.Z, 100.f, 160.f);
+			FHitResult H;
+			SetActorLocation(Nudge, true, &H);
+		}
 		return;
 	}
 
-	if (StuckT > 1.1f)
+	// Patient snag detect — less thrash; still recover without leaping
+	if (StuckT > 0.85f)
 	{
 		++StuckEvents;
-		StuckT = 0.f;
-		UnstickT = 0.5f;
-		// Sidestep with SWEEP only — no wall-phasing teleports
-		const FVector Fwd = GetActorForwardVector().GetSafeNormal2D();
-		const FVector Side = FVector(-Fwd.Y, Fwd.X, 0.f) * (FMath::FRand() < 0.5f ? 1.f : -1.f);
-		UnstickDir = (Side + Fwd * 0.35f).GetSafeNormal2D();
-		FVector Try = Now + UnstickDir * 100.f + Fwd * 40.f;
-		Try.Z = FMath::Clamp(Now.Z, 100.f, 160.f);
-		FHitResult Hit;
-		SetActorLocation(Try, true, &Hit);
-		if (Hit.bBlockingHit || !IsLocationClear(GetActorLocation()))
+		StuckT = 0.35f; // partial decay so we don't re-trigger every frame
+		UnstickT = 0.4f;
+		PreferDetourSign *= -1.f;
+		PathWaypoints.Reset();
+		PathIndex = 0;
+		PathRebuildT = 0.2f;
+		PathFailStreak = 0;
+
+		BashNearestObstacle();
+
+		const FVector GoalHint = PathGoal.IsNearlyZero()
+			? GetActorForwardVector().GetSafeNormal2D()
+			: (PathGoal - Now).GetSafeNormal2D();
+		FVector BestDir = FindBestSteerDir(GoalHint.IsNearlyZero() ? GetActorForwardVector() : GoalHint, 280.f);
+		if (BestDir.IsNearlyZero())
 		{
-			// Other side
-			Try = Now - UnstickDir * 100.f + Fwd * 30.f;
-			Try.Z = FMath::Clamp(Now.Z, 100.f, 160.f);
-			SetActorLocation(Try, true);
+			BestDir = FVector(PreferDetourSign, 0.f, 0.f).GetSafeNormal2D();
 		}
-		if (!IsLocationClear(GetActorLocation()))
+		UnstickDir = BestDir;
+		// Tiny lateral ease (≤50cm) — not a 1.8m hop
+		FVector Ease = Now + BestDir * 45.f;
+		Ease.Z = FMath::Clamp(Now.Z, 100.f, 160.f);
+		if (IsLocationClear(Ease))
+		{
+			FHitResult Hit;
+			SetActorLocation(Ease, true, &Hit);
+		}
+		else if (!IsLocationClear(Now))
 		{
 			ResolveWallPenetration();
 		}
-		UE_LOG(LogTemp, Verbose, TEXT("[RebelstarDelta] Unstick %s (event %d)"), *UnitName, StuckEvents);
+		UE_LOG(LogTemp, Verbose, TEXT("[RebelstarDelta] Unstick %s (event %d) smooth"), *UnitName, StuckEvents);
 	}
 }
 
@@ -671,72 +849,608 @@ void ARDBot::ResolveWallPenetration()
 	}
 }
 
-void ARDBot::MoveToward(const FVector& WorldTarget, float DeltaSeconds, float SpeedScale)
+FVector ARDBot::ComputeSeparation() const
 {
-	FVector To = WorldTarget - GetActorLocation();
-	To.Z = 0.f;
-	const float Dist = To.Size();
-	if (Dist < 90.f)
+	FVector Push = FVector::ZeroVector;
+	// Hard bubble (collision trap) + soft tactical bubble (keep lanes open)
+	const float HardR = bIsRobot ? 260.f : 220.f;
+	const float SoftR = bIsRobot ? 420.f : 380.f;
+	TArray<AActor*> Bots;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDBot::StaticClass(), Bots);
+	for (AActor* A : Bots)
+	{
+		const ARDBot* O = Cast<ARDBot>(A);
+		if (!O || O == this || O->IsDead() || O->Team != Team) continue;
+		FVector D = GetActorLocation() - O->GetActorLocation();
+		D.Z = 0.f;
+		const float L = D.Size();
+		if (L < 1.f || L > SoftR) continue;
+		const FVector N = D / L;
+		if (L < HardR)
+		{
+			// Strong inverse push inside hard bubble
+			const float T = (HardR - L) / HardR;
+			Push += N * (HardR - L) * (1.4f + T * 2.2f);
+		}
+		else
+		{
+			// Mild soft spacing so the squad does not re-clump after unstacking
+			const float T = (SoftR - L) / (SoftR - HardR);
+			Push += N * T * 55.f;
+		}
+		// Bias push along formation lane (prefer own Y over same-X stack)
+		const float MyLane = GetFormationLaneY();
+		const float TheirLane = O->GetFormationLaneY();
+		if (FMath::Abs(MyLane - TheirLane) > 80.f)
+		{
+			const float LanePush = FMath::Sign(MyLane - TheirLane);
+			Push.Y += LanePush * 40.f;
+		}
+	}
+	return Push;
+}
+
+bool ARDBot::ShouldYieldAtChoke(const FVector& ChokeLoc, float Radius) const
+{
+	const float MyD = FVector::Dist2D(GetActorLocation(), ChokeLoc);
+	if (MyD > Radius + 120.f) return false;
+	TArray<AActor*> Bots;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDBot::StaticClass(), Bots);
+	int32 Closer = 0;
+	int32 InBubble = 0;
+	for (AActor* A : Bots)
+	{
+		const ARDBot* O = Cast<ARDBot>(A);
+		if (!O || O == this || O->IsDead() || O->Team != Team) continue;
+		const float OD = FVector::Dist2D(O->GetActorLocation(), ChokeLoc);
+		if (OD < Radius) ++InBubble;
+		if (OD + 40.f < MyD && OD < Radius)
+		{
+			++Closer;
+			// Humans always yield to robots at the door
+			if (!bIsRobot && O->IsRobot()) return true;
+			// Lower slot (point/breach) has right-of-way
+			if (FormationSlot > O->GetFormationSlot() && O->GetFormationSlot() <= 1) return true;
+		}
+	}
+	// One body in the choke mouth; second only if robot trail
+	const int32 MaxInChoke = 1;
+	if (InBubble >= 2 && MyD < Radius * 0.85f) return true;
+	return Closer >= MaxInChoke;
+}
+
+int32 ARDBot::CountAlliesNear(const FVector& Loc, float Radius) const
+{
+	int32 N = 0;
+	TArray<AActor*> Bots;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDBot::StaticClass(), Bots);
+	for (AActor* A : Bots)
+	{
+		const ARDBot* O = Cast<ARDBot>(A);
+		if (!O || O->IsDead() || O->Team != Team) continue;
+		if (FVector::Dist2D(O->GetActorLocation(), Loc) < Radius) ++N;
+	}
+	return N;
+}
+
+bool ARDBot::HasWalkableLOS(const FVector& From, const FVector& To) const
+{
+	UWorld* World = GetWorld();
+	if (!World) return true;
+
+	const float Rad = GetCapsuleComponent() ? GetCapsuleComponent()->GetScaledCapsuleRadius() * 0.72f : 40.f;
+	const float Half = GetCapsuleComponent() ? GetCapsuleComponent()->GetScaledCapsuleHalfHeight() * 0.55f : 55.f;
+	const float Z = FMath::Clamp(From.Z, 110.f, 150.f);
+
+	FVector A = From;
+	FVector B = To;
+	A.Z = Z;
+	B.Z = Z;
+
+	const float Dist2D = FVector::Dist2D(A, B);
+	if (Dist2D < 25.f) return true;
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(RDWalkLOS), false, this);
+	Params.bTraceComplex = false;
+	// Ignore living pawns so pathing routes through allies (separation handles crowd)
+	TArray<AActor*> Bots;
+	UGameplayStatics::GetAllActorsOfClass(World, ARDBot::StaticClass(), Bots);
+	for (AActor* ABot : Bots)
+	{
+		if (ABot && ABot != this) Params.AddIgnoredActor(ABot);
+	}
+	if (APawn* P = UGameplayStatics::GetPlayerPawn(World, 0))
+	{
+		Params.AddIgnoredActor(P);
+	}
+
+	FHitResult Hit;
+	const FCollisionShape Cap = FCollisionShape::MakeCapsule(Rad, Half);
+	const bool bHit = World->SweepSingleByChannel(Hit, A, B, FQuat::Identity, ECC_Visibility, Cap, Params);
+	if (!bHit || !Hit.bBlockingHit) return true;
+	// Allow very grazing hits near destination (door frames / tip of capsule)
+	return Hit.Distance > Dist2D * 0.90f;
+}
+
+void ARDBot::CollectPathLandmarks(TArray<FVector>& Out) const
+{
+	Out.Reset();
+	const float Z = 120.f;
+
+	// Fixed moonbase graph (MapOrigin 4000,-9900 CS=300 — airlock P-row)
+	// Outer approach / LZ chain
+	Out.Add(FVector(-9000.f, -5850.f, Z)); // Approach LZ
+	Out.Add(FVector(-4000.f, -5850.f, Z)); // Mid regolith
+	Out.Add(FVector(1000.f, -5850.f, Z));
+	Out.Add(FVector(3500.f, -5850.f, Z)); // Outer airlock mouth
+	Out.Add(FVector(4300.f, -5850.f, Z)); // Airlock tunnel outer
+	Out.Add(FVector(5300.f, -5850.f, Z)); // Inner airlock / P-row
+	Out.Add(FVector(5600.f, -5850.f, Z)); // Just inside base
+
+	// North / south flanks into base
+	Out.Add(FVector(3500.f, -7600.f, Z));
+	Out.Add(FVector(5400.f, -7600.f, Z));
+	Out.Add(FVector(6200.f, -7600.f, Z));
+	Out.Add(FVector(3500.f, -3800.f, Z));
+	Out.Add(FVector(5400.f, -3800.f, Z));
+	Out.Add(FVector(6200.f, -3800.f, Z));
+
+	// Interior spine + plaza + ISAAC approach
+	Out.Add(FVector(7000.f, -5850.f, Z));
+	Out.Add(FVector(8500.f, -5850.f, Z));
+	Out.Add(FVector(10000.f, -5850.f, Z));
+	Out.Add(FVector(8500.f, -6750.f, Z));
+	Out.Add(FVector(10000.f, -6750.f, Z));
+	Out.Add(FVector(11500.f, -6750.f, Z)); // ISAAC corridor
+	Out.Add(FVector(12000.f, -6750.f, Z)); // ISAAC door zone
+	Out.Add(FVector(12500.f, -5850.f, Z));
+	Out.Add(FVector(12500.f, -7600.f, Z));
+	Out.Add(FVector(7000.f, -4500.f, Z)); // south interior
+	Out.Add(FVector(7000.f, -7200.f, Z)); // north interior
+	Out.Add(FVector(9000.f, -4500.f, Z));
+	Out.Add(FVector(9000.f, -7200.f, Z));
+
+	// Dynamic: door / ISAAC from game mode
+	if (const ARDGameMode* GM = Cast<ARDGameMode>(UGameplayStatics::GetGameMode(GetWorld())))
+	{
+		const FVector Door = GM->GetIsaacDoorBlockPoint();
+		if (!Door.IsNearlyZero())
+		{
+			Out.Add(Door);
+			Out.Add(Door + FVector(-400.f, 0.f, 0.f));
+			Out.Add(Door + FVector(-400.f, 250.f, 0.f));
+			Out.Add(Door + FVector(-400.f, -250.f, 0.f));
+		}
+		const FVector Way = GM->GetApproachWaypoint(FormationSlot);
+		Out.Add(Way);
+		Out.Add(Way + FVector(-800.f, 0.f, 0.f));
+	}
+
+	// Soft Z clamp
+	for (FVector& L : Out)
+	{
+		L.Z = Z;
+	}
+}
+
+bool ARDBot::TryAppendDetour(const FVector& A, const FVector& B, TArray<FVector>& OutPath) const
+{
+	FVector Delta = B - A;
+	Delta.Z = 0.f;
+	const float Len = Delta.Size();
+	if (Len < 80.f) return false;
+
+	const FVector Dir = Delta / Len;
+	const FVector Side(-Dir.Y, Dir.X, 0.f);
+	const FVector Mid = (A + B) * 0.5f;
+
+	// Try preferred side first, then opposite, at several offsets
+	const float Offsets[] = { 220.f, 380.f, 560.f, 780.f, 1100.f };
+	const float Signs[] = { PreferDetourSign, -PreferDetourSign };
+
+	for (float Sign : Signs)
+	{
+		for (float Off : Offsets)
+		{
+			const FVector Corner = Mid + Side * Sign * Off;
+			FVector C = Corner;
+			C.Z = 120.f;
+			// Also try two-point detours along the blocked segment
+			const FVector Q1 = A + Dir * (Len * 0.33f) + Side * Sign * Off;
+			const FVector Q2 = A + Dir * (Len * 0.66f) + Side * Sign * Off;
+			FVector P1 = Q1; P1.Z = 120.f;
+			FVector P2 = Q2; P2.Z = 120.f;
+
+			if (HasWalkableLOS(A, C) && HasWalkableLOS(C, B))
+			{
+				OutPath.Add(C);
+				return true;
+			}
+			if (HasWalkableLOS(A, P1) && HasWalkableLOS(P1, P2) && HasWalkableLOS(P2, B))
+			{
+				OutPath.Add(P1);
+				OutPath.Add(P2);
+				return true;
+			}
+			if (HasWalkableLOS(A, P1) && HasWalkableLOS(P1, B))
+			{
+				OutPath.Add(P1);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void ARDBot::RebuildPathTo(const FVector& Goal)
+{
+	PathWaypoints.Reset();
+	PathIndex = 0;
+	PathGoal = Goal;
+	PathGoal.Z = 120.f;
+
+	const FVector Start = GetActorLocation();
+	FVector End = Goal;
+	End.Z = 120.f;
+
+	const float GoalDist = FVector::Dist2D(Start, End);
+	if (GoalDist < 90.f)
 	{
 		return;
 	}
-	const FVector Dir = To / Dist;
-	const float Step = MoveSpeed * SpeedScale * DeltaSeconds;
-	FVector Desired = GetActorLocation() + Dir * FMath::Min(Step, Dist);
-	// Keep feet on playable height (plain + base floor)
-	Desired.Z = FMath::Clamp(GetActorLocation().Z, 100.f, 160.f);
 
-	// ALWAYS sweep against walls. (No-sweep long moves were walking through base geometry.)
-	// On open regolith west of the base we still sweep, but take a slightly larger step.
-	const bool bOpenPlain = GetActorLocation().X < 4800.f;
-	if (bOpenPlain && Dist > 2000.f)
+	// Direct walkable → single hop
+	if (HasWalkableLOS(Start, End))
 	{
-		// Pad bumps: try sweep first; only if blocked by a tiny floor prop, slide sideways with sweep
-		FHitResult Hit;
-		SetActorLocation(Desired, true, &Hit);
-		if (Hit.bBlockingHit)
-		{
-			const FVector Slide = FVector::VectorPlaneProject(Dir, Hit.Normal).GetSafeNormal() * Step;
-			FVector SlidePos = GetActorLocation() + Slide;
-			SlidePos.Z = Desired.Z;
-			SetActorLocation(SlidePos, true);
-		}
+		PathWaypoints.Add(End);
+		PathFailStreak = 0;
+		return;
 	}
-	else
+
+	// === Off-the-shelf: Unreal NavigationSystem / Recast path (if NavMesh built) ===
+	if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
 	{
-		FHitResult Hit;
-		SetActorLocation(Desired, true, &Hit);
-		if (Hit.bBlockingHit)
+		const FVector NavStart(Start.X, Start.Y, 120.f);
+		const FVector NavEnd(End.X, End.Y, 120.f);
+		if (UNavigationPath* NavPath = NavSys->FindPathToLocationSynchronously(GetWorld(), NavStart, NavEnd, this))
 		{
-			// Wall slide — never disable sweep (that caused wall-phasing)
-			const FVector Slide = FVector::VectorPlaneProject(Dir, Hit.Normal).GetSafeNormal() * Step * 0.9f;
-			FVector SlidePos = GetActorLocation() + Slide;
-			SlidePos.Z = Desired.Z;
-			FHitResult Hit2;
-			SetActorLocation(SlidePos, true, &Hit2);
-			if (Hit2.bBlockingHit)
+			if (NavPath->IsValid() && NavPath->PathPoints.Num() >= 2)
 			{
-				// Try opposite slide axis
-				const FVector Side(-Dir.Y, Dir.X, 0.f);
-				for (float S : { 1.f, -1.f })
+				for (int32 i = 1; i < NavPath->PathPoints.Num(); ++i)
 				{
-					FVector Alt = GetActorLocation() + Side * S * Step * 0.8f + Dir * Step * 0.25f;
-					Alt.Z = Desired.Z;
-					FHitResult Hit3;
-					SetActorLocation(Alt, true, &Hit3);
-					if (!Hit3.bBlockingHit) break;
+					FVector P = NavPath->PathPoints[i];
+					P.Z = 120.f;
+					if (PathWaypoints.Num() == 0 || FVector::Dist2D(PathWaypoints.Last(), P) > 80.f)
+					{
+						PathWaypoints.Add(P);
+					}
+				}
+				if (PathWaypoints.Num() > 0)
+				{
+					PathIndex = 0;
+					PathFailStreak = 0;
+					PreferDetourSign = (FormationSlot % 2 == 0) ? 1.f : -1.f;
+					return; // engine path wins over hand landmarks
 				}
 			}
 		}
 	}
 
-	// If we somehow ended inside solid (spawn / unstick residue), eject
+	// === Fallback: authored moonbase landmarks + geometric detours ===
+	TArray<FVector> Marks;
+	CollectPathLandmarks(Marks);
+
+	// Greedy landmark chain: repeatedly pick nearest landmark that advances toward goal with walkable LOS
+	FVector Cursor = Start;
+	TArray<FVector> Chain;
+	const int32 MaxHops = 10;
+	TSet<int32> Used;
+
+	for (int32 Hop = 0; Hop < MaxHops; ++Hop)
+	{
+		if (HasWalkableLOS(Cursor, End))
+		{
+			Chain.Add(End);
+			break;
+		}
+
+		int32 BestIdx = INDEX_NONE;
+		float BestScore = -1.e9f;
+		for (int32 i = 0; i < Marks.Num(); ++i)
+		{
+			if (Used.Contains(i)) continue;
+			const FVector& M = Marks[i];
+			if (FVector::Dist2D(Cursor, M) < 120.f) continue;
+			if (FVector::Dist2D(M, End) > FVector::Dist2D(Cursor, End) + 400.f) continue; // must roughly advance
+			if (!HasWalkableLOS(Cursor, M)) continue;
+
+			// Score: progress toward goal minus path length cost
+			const float Progress = FVector::Dist2D(Cursor, End) - FVector::Dist2D(M, End);
+			const float Cost = FVector::Dist2D(Cursor, M) * 0.15f;
+			const float Score = Progress * 2.2f - Cost;
+			if (Score > BestScore)
+			{
+				BestScore = Score;
+				BestIdx = i;
+			}
+		}
+
+		if (BestIdx == INDEX_NONE)
+		{
+			// No landmark LOS — try geometric detour toward goal, then bail to partial
+			TArray<FVector> Det;
+			if (TryAppendDetour(Cursor, End, Det))
+			{
+				for (const FVector& D : Det)
+				{
+					Chain.Add(D);
+					Cursor = D;
+				}
+				if (HasWalkableLOS(Cursor, End))
+				{
+					Chain.Add(End);
+				}
+				else
+				{
+					// leave partial path; MoveToward will repath soon
+					Chain.Add(End);
+				}
+			}
+			else
+			{
+				// Last resort: push a side offset waypoint and the goal (local slide still helps)
+				const FVector Dir = (End - Cursor).GetSafeNormal2D();
+				const FVector Side(-Dir.Y, Dir.X, 0.f);
+				const FVector Esc = Cursor + Side * PreferDetourSign * 420.f + Dir * 200.f;
+				Chain.Add(FVector(Esc.X, Esc.Y, 120.f));
+				Chain.Add(End);
+			}
+			break;
+		}
+
+		Used.Add(BestIdx);
+		const FVector Next = Marks[BestIdx];
+		// If direct landmark hop blocked somehow (shouldn't), insert detour
+		if (!HasWalkableLOS(Cursor, Next))
+		{
+			TArray<FVector> Det;
+			if (TryAppendDetour(Cursor, Next, Det))
+			{
+				for (const FVector& D : Det) Chain.Add(D);
+			}
+		}
+		Chain.Add(Next);
+		Cursor = Next;
+	}
+
+	// Ensure final goal present
+	if (Chain.Num() == 0 || FVector::Dist2D(Chain.Last(), End) > 50.f)
+	{
+		// Try detour from last chain point (or start) to end
+		const FVector From = Chain.Num() ? Chain.Last() : Start;
+		if (!HasWalkableLOS(From, End))
+		{
+			TArray<FVector> Det;
+			if (TryAppendDetour(From, End, Det))
+			{
+				for (const FVector& D : Det) Chain.Add(D);
+			}
+		}
+		Chain.Add(End);
+	}
+
+	// Compact collinear-ish points
+	PathWaypoints.Reserve(Chain.Num());
+	for (int32 i = 0; i < Chain.Num(); ++i)
+	{
+		FVector P = Chain[i];
+		P.Z = 120.f;
+		if (PathWaypoints.Num() > 0 && FVector::Dist2D(PathWaypoints.Last(), P) < 90.f) continue;
+		// Skip if we can already see past this point to the next
+		if (PathWaypoints.Num() > 0 && i + 1 < Chain.Num())
+		{
+			const FVector NextP = Chain[i + 1];
+			if (HasWalkableLOS(PathWaypoints.Last(), NextP))
+			{
+				continue; // skip redundant mid
+			}
+		}
+		PathWaypoints.Add(P);
+	}
+	if (PathWaypoints.Num() == 0)
+	{
+		PathWaypoints.Add(End);
+	}
+
+	PathIndex = 0;
+	PathFailStreak = 0;
+	// Alternate preferred detour side each rebuild so packs split around walls
+	PreferDetourSign = (FormationSlot % 2 == 0) ? 1.f : -1.f;
+	if ((StuckEvents + GetUniqueID()) % 3 == 0) PreferDetourSign *= -1.f;
+}
+
+FVector ARDBot::GetPathFollowPoint(const FVector& Goal) const
+{
+	if (PathWaypoints.Num() == 0 || PathIndex >= PathWaypoints.Num())
+	{
+		return Goal;
+	}
+	return PathWaypoints[PathIndex];
+}
+
+void ARDBot::MoveToward(const FVector& WorldTarget, float DeltaSeconds, float SpeedScale)
+{
+	FVector Goal = WorldTarget;
+	Goal.Z = FMath::Clamp(GetActorLocation().Z, 100.f, 160.f);
+
+	// --- Path management ---
+	PathRebuildT -= DeltaSeconds;
+	const float GoalShift = FVector::Dist2D(Goal, PathGoal);
+	const bool bNeedPath =
+		PathWaypoints.Num() == 0
+		|| PathIndex >= PathWaypoints.Num()
+		|| GoalShift > 280.f
+		|| PathRebuildT <= 0.f
+		|| PathFailStreak >= 3;
+
+	if (bNeedPath)
+	{
+		RebuildPathTo(Goal);
+		// Longer sticky paths — less repath thrash / direction flips
+		PathRebuildT = FMath::FRandRange(0.9f, 1.5f);
+	}
+
+	// Advance along waypoints when close
+	while (PathIndex < PathWaypoints.Num())
+	{
+		const float DWp = FVector::Dist2D(GetActorLocation(), PathWaypoints[PathIndex]);
+		if (DWp < 110.f)
+		{
+			++PathIndex;
+			continue;
+		}
+		// Skip waypoint if we already have walkable LOS to a later one (shortcut)
+		bool bSkipped = false;
+		for (int32 Look = PathWaypoints.Num() - 1; Look > PathIndex; --Look)
+		{
+			if (HasWalkableLOS(GetActorLocation(), PathWaypoints[Look]))
+			{
+				PathIndex = Look;
+				bSkipped = true;
+				break;
+			}
+		}
+		if (bSkipped) continue;
+		break;
+	}
+
+	FVector StepTarget = GetPathFollowPoint(Goal);
+	// If current segment blocked, force rebuild with opposite detour
+	if (PathIndex < PathWaypoints.Num() && !HasWalkableLOS(GetActorLocation(), StepTarget))
+	{
+		++PathFailStreak;
+		if (PathFailStreak >= 2)
+		{
+			PreferDetourSign *= -1.f;
+			RebuildPathTo(Goal);
+			PathRebuildT = 0.55f;
+			StepTarget = GetPathFollowPoint(Goal);
+		}
+	}
+
+	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
+	FVector To = StepTarget - GetActorLocation();
+	To.Z = 0.f;
+	const float Dist = To.Size();
+
+	// Mild crowd ease only — heavy 0.42× made whole squad crawl
+	const int32 Crowd = CountAlliesNear(GetActorLocation(), 280.f);
+	float CrowdSlow = 1.f;
+	if (Crowd >= 5) CrowdSlow = 0.78f;
+	else if (Crowd >= 3) CrowdSlow = 0.88f;
+
+	// Assault pace: base speeds already raised; SpeedScale from tactics still applies
+	const float Spd = MoveSpeed * SpeedScale * CrowdSlow;
+	if (MoveComp)
+	{
+		MoveComp->MaxWalkSpeed = Spd;
+		MoveComp->MaxFlySpeed = Spd;
+		MoveComp->MaxAcceleration = 14000.f;
+		if (MoveComp->MovementMode != MOVE_Flying)
+		{
+			MoveComp->SetMovementMode(MOVE_Flying);
+		}
+	}
+
+	if (Dist < 70.f)
+	{
+		const FVector Sep = ComputeSeparation();
+		if (Sep.Size() > 8.f)
+		{
+			FVector Nudge = GetActorLocation() + Sep.GetSafeNormal() * Spd * 0.7f * DeltaSeconds;
+			Nudge.Z = FMath::Clamp(GetActorLocation().Z, 100.f, 160.f);
+			FHitResult H;
+			SetActorLocation(Nudge, true, &H);
+			if (MoveComp) MoveComp->RequestDirectMove(Sep.GetSafeNormal() * Spd * 0.5f, true);
+		}
+		else if (MoveComp)
+		{
+			MoveComp->RequestDirectMove(FVector::ZeroVector, false);
+		}
+		return;
+	}
+
+	FVector WantDir = To / Dist;
+	WantDir = FindBestSteerDir(WantDir, FMath::Clamp(Spd * 0.25f + 140.f, 140.f, 320.f));
+
+	const FVector Sep = ComputeSeparation();
+	if (Sep.Size() > 1.f)
+	{
+		const float SepW = FMath::Clamp(Sep.Size() / 160.f, 0.f, 0.85f);
+		WantDir = (WantDir + Sep.GetSafeNormal() * SepW * 0.75f).GetSafeNormal();
+	}
+
+	if (!bSmoothMoveInit || SmoothMoveDir.IsNearlyZero())
+	{
+		SmoothMoveDir = WantDir;
+		bSmoothMoveInit = true;
+	}
+	else
+	{
+		// Faster heading catch-up (5.5 felt sticky / slow to commit)
+		SmoothMoveDir = FMath::VInterpTo(SmoothMoveDir, WantDir, DeltaSeconds, 11.f).GetSafeNormal2D();
+		if (SmoothMoveDir.IsNearlyZero()) SmoothMoveDir = WantDir;
+	}
+	const FVector Dir = SmoothMoveDir;
+
+	// Primary: reliable swept step (CMC-only fly was under-moving without AIController)
+	const float Step = Spd * DeltaSeconds;
+	FVector Desired = GetActorLocation() + Dir * FMath::Min(Step, Dist);
+	Desired.Z = FMath::Clamp(GetActorLocation().Z, 110.f, 155.f);
+	FHitResult Hit;
+	SetActorLocation(Desired, true, &Hit);
+	if (Hit.bBlockingHit)
+	{
+		++PathFailStreak;
+		const FVector Slide = FVector::VectorPlaneProject(Dir, Hit.Normal).GetSafeNormal2D();
+		if (!Slide.IsNearlyZero())
+		{
+			FVector SlidePos = GetActorLocation() + Slide * Step * 0.95f;
+			SlidePos.Z = Desired.Z;
+			SetActorLocation(SlidePos, true);
+			SmoothMoveDir = FMath::VInterpTo(SmoothMoveDir, Slide, DeltaSeconds, 10.f).GetSafeNormal2D();
+		}
+		if (AActor* Blocker = Hit.GetActor())
+		{
+			if (Cast<ARDDestructible>(Blocker) || Cast<ARDRoomDoor>(Blocker) || Cast<ARDWreckage>(Blocker)
+				|| Blocker->ActorHasTag(FName(TEXT("RD_Breach"))))
+			{
+				TryBreachTarget(Blocker, 2.6f);
+			}
+		}
+	}
+	else if (PathFailStreak > 0)
+	{
+		--PathFailStreak;
+	}
+
+	// Secondary: feed RVO so engine still de-stacks pawns
+	if (MoveComp)
+	{
+		MoveComp->RequestDirectMove(Dir * Spd, true);
+		MoveComp->Velocity = FVector(Dir.X * Spd, Dir.Y * Spd, 0.f);
+	}
+
 	if (!IsLocationClear(GetActorLocation()))
 	{
 		ResolveWallPenetration();
+		PathFailStreak += 1;
+		PathRebuildT = FMath::Min(PathRebuildT, 0.25f);
 	}
-
-	SetActorRotation(FMath::RInterpTo(GetActorRotation(), Dir.Rotation(), DeltaSeconds, 12.f));
+	if (!Dir.IsNearlyZero())
+	{
+		SetActorRotation(FMath::RInterpTo(GetActorRotation(), Dir.Rotation(), DeltaSeconds, 7.f));
+	}
 }
 
 AActor* ARDBot::FindNearestEnemy() const
@@ -832,6 +1546,117 @@ AActor* ARDBot::FindNearestFriendlyRobot() const
 	return Best;
 }
 
+AActor* ARDBot::FindNearestBreachable() const
+{
+	TArray<AActor*> Props;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDDestructible::StaticClass(), Props);
+	AActor* Best = nullptr;
+	float BestD = 2200.f;
+	for (AActor* A : Props)
+	{
+		const ARDDestructible* D = Cast<ARDDestructible>(A);
+		if (!D || D->IsDestroyed()) continue;
+		const bool bDoorish = D->Kind.Contains(TEXT("door"), ESearchCase::IgnoreCase)
+			|| D->Kind.Contains(TEXT("Sealed"), ESearchCase::IgnoreCase)
+			|| A->ActorHasTag(FName(TEXT("RD_Breach")));
+		const float Dist = FVector::Dist(GetActorLocation(), A->GetActorLocation());
+		const float Score = Dist * (bDoorish ? 0.55f : 1.f);
+		if (Score < BestD) { BestD = Score; Best = A; }
+	}
+	return Best;
+}
+
+void ARDBot::TryBreachTarget(AActor* Target, float DamageMul)
+{
+	if (!Target || !GetWorld() || bDead) return;
+	const bool bDoor = Cast<ARDRoomDoor>(Target) != nullptr;
+	const bool bWreck = Cast<ARDWreckage>(Target) != nullptr;
+	const bool bPriorityBreach = bDoor || bWreck;
+	// Doors: allow faster re-fire so "always shoot when close" actually melts the choke
+	if (FireCD > 0.f)
+	{
+		if (!bPriorityBreach) return;
+		if (FireCD > FireInterval * 0.22f) return;
+	}
+
+	const FVector Start = GetActorLocation() + FVector(0.f, 0.f, 70.f);
+	const FVector Aim = Target->GetActorLocation() + FVector(0.f, 0.f, 50.f);
+	const float Dist = FVector::Dist(Start, Aim);
+	const float MaxR = bPriorityBreach ? FMath::Max(WeaponRange * 1.15f, 1500.f) : WeaponRange * 1.05f;
+	if (Dist > MaxR) return;
+
+	// Doors/wreck in range: always blast (no LOS reject — greybox frames block traces)
+	const bool bClose = Dist < 900.f || bPriorityBreach;
+	if (!bClose)
+	{
+		FHitResult LosHit;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(RDBreachLos), false, this);
+		if (GetWorld()->LineTraceSingleByChannel(LosHit, Start, Aim, ECC_Visibility, Params))
+		{
+			if (LosHit.GetActor() != Target && LosHit.GetActor() != Target->GetOwner())
+			{
+				return;
+			}
+		}
+	}
+
+	FireCD = FireInterval * (bPriorityBreach ? (bIsRobot ? 0.28f : 0.32f) : (bIsRobot ? 0.45f : 0.55f));
+	const FColor Beam = (Team == ERDBotTeam::Ally)
+		? (bIsRobot ? FColor(40, 230, 255) : FColor(60, 255, 90))
+		: FColor(255, 40, 30);
+	RDLaserFX::DrawBeam(GetWorld(), Start, Aim, Beam, bIsRobot ? 20.f : 15.f, 0.3f);
+	RDLaserFX::PlayZap(GetWorld(), Start, Team == ERDBotTeam::Ally);
+
+	const float Dmg = ShotDamage * DamageMul * (bIsRobot ? 1.25f : 1.f);
+	if (ARDRoomDoor* Door = Cast<ARDRoomDoor>(Target))
+	{
+		Door->TakeDamageAmount(Dmg * 2.6f);
+	}
+	else if (ARDWreckage* W = Cast<ARDWreckage>(Target))
+	{
+		W->TakeDamageAmount(Dmg * 2.0f);
+	}
+	else if (ARDDestructible* Prop = Cast<ARDDestructible>(Target))
+	{
+		Prop->TakeDamageAmount(Dmg * 1.6f);
+	}
+}
+
+void ARDBot::AlwaysShootNearbyBreach()
+{
+	if (bDead || Team != ERDBotTeam::Ally) return;
+
+	// Priority 1: ISAAC room door / door wreck within "close" range → always fire
+	const float DoorShootR = 1400.f;
+	if (AActor* DoorOrWreck = FindNearestRoomDoor())
+	{
+		const float D = FVector::Dist(GetActorLocation(), DoorOrWreck->GetActorLocation());
+		if (D < DoorShootR)
+		{
+			TryBreachTarget(DoorOrWreck, 3.0f);
+			return;
+		}
+	}
+
+	// Priority 2: sealed % panels / breach-tagged scenery nearby
+	if (AActor* Prop = FindNearestBreachable())
+	{
+		const float D = FVector::Dist(GetActorLocation(), Prop->GetActorLocation());
+		if (D < 1000.f)
+		{
+			const ARDDestructible* Des = Cast<ARDDestructible>(Prop);
+			const bool bDoorish = Des && (Des->Kind.Contains(TEXT("door"), ESearchCase::IgnoreCase)
+				|| Des->Kind.Contains(TEXT("Sealed"), ESearchCase::IgnoreCase)
+				|| Prop->ActorHasTag(FName(TEXT("RD_Breach"))));
+			if (bDoorish || D < 550.f)
+			{
+				TryBreachTarget(Prop, bDoorish ? 2.4f : 1.6f);
+			}
+		}
+	}
+}
+
+
 bool ARDBot::EngageTactically(AActor* Target, float DeltaSeconds)
 {
 	if (!Target || bDead) return false;
@@ -863,8 +1688,10 @@ bool ARDBot::EngageTactically(AActor* Target, float DeltaSeconds)
 		{
 			// Strafe — keep distance, do not close
 			const FVector To = (Target->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
-			const FVector Side = FVector(-To.Y, To.X, 0.f) * ((FormationSlot % 2 == 0) ? 1.f : -1.f);
-			MoveToward(GetActorLocation() + Side * 350.f - To * 80.f, DeltaSeconds, 1.1f);
+			const float LaneSign = (GetFormationLaneY() >= 0.f) ? 1.f : -1.f;
+			const FVector Side = FVector(-To.Y, To.X, 0.f) * LaneSign;
+			// Strafe on own flank — keep soft separation from friendlies while kiting
+			MoveToward(GetActorLocation() + Side * 420.f - To * 90.f + GetFormationOffset() * 0.15f, DeltaSeconds, 1.1f);
 			TryFireAt(Target);
 			return true;
 		}
@@ -1025,6 +1852,253 @@ void ARDBot::TryFireAt(AActor* Target)
 	}
 }
 
+
+void ARDBot::TickAllyStormAssault(float DeltaSeconds, AActor* Enemy, AActor* Isaac, const FVector& AssaultRally)
+{
+	const FVector Me = GetActorLocation();
+	const FVector Form = GetFormationOffset();
+	// Squad roles by unique slot (not % 3 — that collapsed 6 people into 3 piles)
+	// 0 BREACH point · 1/2 WING support · 3/4 FAR FLANK · 5/6 REAR
+	int32 SquadRole = 1; // support default
+	if (FormationSlot == 0 || bIsRobot || UnitName.Equals(TEXT("Trump"), ESearchCase::IgnoreCase)) SquadRole = 0;
+	else if (FormationSlot == 3 || FormationSlot == 4
+		|| UnitName.Contains(TEXT("Haley")) || UnitName.Contains(TEXT("Rubio"))) SquadRole = 2;
+	else if (FormationSlot == 5 || FormationSlot == 6) SquadRole = 1;
+
+	AActor* DoorOrWreck = FindNearestRoomDoor();
+	AActor* BreachProp = FindNearestBreachable();
+	AActor* PrimaryBreach = DoorOrWreck ? DoorOrWreck : BreachProp;
+
+	// Open-ground approach: each unit owns a lateral lane + depth — wedge not blob
+	const float ApproachGateX = 5600.f;
+	if (Me.X < ApproachGateX)
+	{
+		FVector Way = AssaultRally + Form;
+		// Far flanks peel early north/south of airlock mouth
+		if (SquadRole == 2)
+		{
+			Way.Y = AssaultRally.Y + Form.Y;
+			Way.X = FMath::Min(Way.X, ApproachGateX - 200.f);
+		}
+		// Wings / rear: trail the breach element on their own lane — do NOT sit on the robot
+		if (!bIsRobot && SquadRole != 2)
+		{
+			if (AActor* Tank = FindNearestFriendlyRobot())
+			{
+				const FVector T = Tank->GetActorLocation();
+				if (T.X > Me.X - 120.f)
+				{
+					// Stay behind and offset — never stack on tank XY
+					Way = T + Form + FVector(-180.f, 0.f, 0.f);
+				}
+			}
+		}
+		// Choke mouth: only point man presses; others hold staged lanes west
+		if (ShouldYieldAtChoke(AssaultRally, 520.f) && SquadRole != 0)
+		{
+			const FVector Hold = GetChokeStagingPoint(AssaultRally, 520.f + FormationSlot * 60.f);
+			MoveToward(Hold, DeltaSeconds, 0.65f);
+			if (Enemy) EngageTactically(Enemy, DeltaSeconds);
+			return;
+		}
+		// Stagger speed: breach first, flanks run, rear walks
+		float Spd = 1.15f;
+		if (SquadRole == 0) Spd = bIsRobot ? 1.55f : 1.35f;
+		else if (SquadRole == 2) Spd = 1.4f;
+		else Spd = 1.05f + 0.05f * (FormationSlot % 2);
+		MoveToward(Way, DeltaSeconds, Spd);
+		if (Enemy && FVector::Dist(Me, Enemy->GetActorLocation()) < 1200.f)
+		{
+			EngageTactically(Enemy, DeltaSeconds);
+		}
+		if (BreachProp && FVector::Dist(Me, BreachProp->GetActorLocation()) < 900.f)
+		{
+			TryBreachTarget(BreachProp, 1.4f);
+		}
+		return;
+	}
+
+	// Inside base — FAR FLANKS stay wide, overwatch / alternate breach
+	if (SquadRole == 2 && PrimaryBreach)
+	{
+		const FVector DoorL = PrimaryBreach->GetActorLocation();
+		const float Side = Form.Y >= 0.f ? 1.f : -1.f;
+		const FVector Flank = DoorL + FVector(-280.f, Side * 900.f, 0.f);
+		if (FVector::Dist2D(Me, Flank) > 220.f)
+		{
+			MoveToward(Flank, DeltaSeconds, 1.25f);
+		}
+		if (Enemy) EngageTactically(Enemy, DeltaSeconds);
+		else TryBreachTarget(PrimaryBreach, 1.1f);
+		return;
+	}
+
+	// WINGS — support from spaced rear corners, not the door sill
+	if (SquadRole == 1 && PrimaryBreach)
+	{
+		const FVector DoorL = PrimaryBreach->GetActorLocation();
+		const FVector Support = GetChokeStagingPoint(DoorL, 480.f);
+		if (ShouldYieldAtChoke(DoorL, 560.f) || FVector::Dist2D(Me, Support) > 200.f)
+		{
+			MoveToward(Support, DeltaSeconds, ShouldYieldAtChoke(DoorL, 560.f) ? 0.75f : 1.1f);
+		}
+		if (Enemy && FVector::Dist(Me, Enemy->GetActorLocation()) < 1600.f)
+		{
+			EngageTactically(Enemy, DeltaSeconds);
+		}
+		TryBreachTarget(PrimaryBreach, 1.5f);
+		if (BreachProp && BreachProp != PrimaryBreach) TryBreachTarget(BreachProp, 1.2f);
+		return;
+	}
+
+	// BREACH element — robots first; humans only if clear
+	if (PrimaryBreach)
+	{
+		const FVector DoorL = PrimaryBreach->GetActorLocation();
+		const float D = FVector::Dist(Me, DoorL);
+		if (ShouldYieldAtChoke(DoorL, 480.f) && !bIsRobot)
+		{
+			MoveToward(GetChokeStagingPoint(DoorL, 420.f), DeltaSeconds, 0.7f);
+			TryBreachTarget(PrimaryBreach, 1.3f);
+			if (Enemy) EngageTactically(Enemy, DeltaSeconds);
+			return;
+		}
+		if (D > 220.f)
+		{
+			// Tiny lateral only for multi-robot; never all on door center
+			FVector DoorGoal = DoorL + FVector(0.f, Form.Y * 0.08f, 0.f);
+			MoveToward(DoorGoal, DeltaSeconds, bIsRobot ? 1.5f : 1.15f);
+		}
+		TryBreachTarget(PrimaryBreach, bIsRobot ? 2.4f : 1.9f);
+		if (Enemy && FVector::Dist(Me, Enemy->GetActorLocation()) < 700.f)
+		{
+			if (bIsRobot) EngageTactically(Enemy, DeltaSeconds);
+			else if (const ARDBot* EB = Cast<ARDBot>(Enemy))
+			{
+				if (!EB->IsRobot()) EngageTactically(Enemy, DeltaSeconds);
+				else TryFireAt(Enemy);
+			}
+		}
+		return;
+	}
+
+	if (Isaac)
+	{
+		const float D = FVector::Dist(Me, Isaac->GetActorLocation());
+		if (ShouldYieldAtChoke(Isaac->GetActorLocation(), 400.f) && SquadRole != 0)
+		{
+			MoveToward(GetChokeStagingPoint(Isaac->GetActorLocation(), 380.f), DeltaSeconds, 0.85f);
+		}
+		else if (D > 300.f)
+		{
+			const FVector Atk = Isaac->GetActorLocation() + FVector(Form.X * 0.3f, Form.Y * 0.45f, 0.f);
+			MoveToward(Atk, DeltaSeconds, 1.3f);
+		}
+		TryFireAt(Isaac);
+		if (Enemy && D < 1100.f) EngageTactically(Enemy, DeltaSeconds);
+		return;
+	}
+
+	if (Enemy) EngageTactically(Enemy, DeltaSeconds);
+	else MoveToward(AssaultRally + Form + FVector(1800.f, 0.f, 0.f), DeltaSeconds, 1.15f);
+}
+
+void ARDBot::TickAllyObjectives(float DeltaSeconds, AActor* Enemy, AActor* Isaac, const FVector& AssaultRally)
+{
+	const FVector Me = GetActorLocation();
+	const FVector Form = GetFormationOffset();
+	AActor* Door = FindNearestRoomDoor();       // ISAAC door or wreck
+	AActor* Panel = FindNearestBreachable();    // sealed % / other doors
+	const float EnemyD = Enemy ? FVector::Dist(Me, Enemy->GetActorLocation()) : 1.e9f;
+	const float DoorD = Door ? FVector::Dist(Me, Door->GetActorLocation()) : 1.e9f;
+	const float PanelD = Panel ? FVector::Dist(Me, Panel->GetActorLocation()) : 1.e9f;
+	const float IsaacD = Isaac ? FVector::Dist(Me, Isaac->GetActorLocation()) : 1.e9f;
+
+	// --- 0) Survive: human vs enemy robot in face ---
+	if (!bIsRobot && Enemy)
+	{
+		if (const ARDBot* EB = Cast<ARDBot>(Enemy))
+		{
+			if (EB->IsRobot() && EnemyD < 1000.f)
+			{
+				EngageTactically(Enemy, DeltaSeconds);
+				AlwaysShootNearbyBreach();
+				return;
+			}
+		}
+	}
+
+	// --- 1) DOORS (ISAAC room door / wreck, then sealed panels) ---
+	// Always shoot when close; move in if not at muzzle range
+	if (Door && DoorD < 1600.f)
+	{
+		AlwaysShootNearbyBreach();
+		TryBreachTarget(Door, 3.2f);
+		if (DoorD > 220.f)
+		{
+			MoveToward(Door->GetActorLocation() + Form * 0.12f, DeltaSeconds, bIsRobot ? 1.55f : 1.4f);
+		}
+		if (Enemy && EnemyD < 750.f) TryFireAt(Enemy);
+		return;
+	}
+	if (Panel && PanelD < 1100.f)
+	{
+		const ARDDestructible* Des = Cast<ARDDestructible>(Panel);
+		const bool bDoorish = Des && (Des->Kind.Contains(TEXT("door"), ESearchCase::IgnoreCase)
+			|| Des->Kind.Contains(TEXT("Sealed"), ESearchCase::IgnoreCase)
+			|| Panel->ActorHasTag(FName(TEXT("RD_Breach"))));
+		if (bDoorish || PanelD < 600.f)
+		{
+			TryBreachTarget(Panel, bDoorish ? 2.8f : 1.8f);
+			if (PanelD > 200.f)
+			{
+				MoveToward(Panel->GetActorLocation(), DeltaSeconds, 1.35f);
+			}
+			if (Enemy && EnemyD < 700.f) TryFireAt(Enemy);
+			return;
+		}
+	}
+
+	// --- 2) ISAAC (win condition) ---
+	if (Isaac)
+	{
+		// Path into base first if still west of airlock mouth
+		if (Me.X < 5600.f)
+		{
+			MoveToward(AssaultRally + Form, DeltaSeconds, bIsRobot ? 1.6f : 1.5f);
+			AlwaysShootNearbyBreach();
+			if (Enemy && EnemyD < 900.f) EngageTactically(Enemy, DeltaSeconds);
+			return;
+		}
+		if (ShouldYieldAtChoke(Isaac->GetActorLocation(), 380.f) && !bIsRobot)
+		{
+			MoveToward(GetChokeStagingPoint(Isaac->GetActorLocation(), 360.f), DeltaSeconds, 1.05f);
+		}
+		else if (IsaacD > 280.f)
+		{
+			const FVector Atk = Isaac->GetActorLocation() + FVector(Form.X * 0.25f, Form.Y * 0.4f, 0.f);
+			MoveToward(Atk, DeltaSeconds, 1.45f);
+		}
+		TryFireAt(Isaac);
+		// Secondary: enemy while on objective
+		if (Enemy && EnemyD < 1200.f) TryFireAt(Enemy);
+		AlwaysShootNearbyBreach();
+		return;
+	}
+
+	// --- 3) ENEMY (clear remaining UK when ISAAC is gone or not found) ---
+	if (Enemy)
+	{
+		EngageTactically(Enemy, DeltaSeconds);
+		AlwaysShootNearbyBreach();
+		return;
+	}
+
+	// --- 4) Push deeper into base / search ---
+	MoveToward(AssaultRally + Form + FVector(2500.f, 0.f, 0.f), DeltaSeconds, 1.4f);
+	AlwaysShootNearbyBreach();
+}
+
 void ARDBot::TickAlly(float DeltaSeconds)
 {
 	APawn* Player = UGameplayStatics::GetPlayerPawn(this, 0);
@@ -1034,191 +2108,54 @@ void ARDBot::TickAlly(float DeltaSeconds)
 		? GM->GetApproachWaypoint(FormationSlot)
 		: FVector(5200.f, -5850.f, 120.f);
 
-	// Spectator loop: always storm (SetOrder can race BeginPlay / Live Coding)
+	// Spectator / training: always assault with full objective chain
 	if (bAIVsAI && Order != ERDSquadOrder::Storm && Order != ERDSquadOrder::Attack)
 	{
 		Order = ERDSquadOrder::Storm;
 	}
 
-	// Humans use tactical target selection (avoid robot head-ons)
 	AActor* Enemy = bIsRobot ? FindNearestEnemy() : FindTacticalEnemy();
 	AActor* Isaac = FindNearestIsaac();
 
-	// Humans: if a robot is too close, ALWAYS kite first (even mid-objective)
-	if (!bIsRobot && Enemy)
+	// AI-vs-AI and Storm/Attack share the same objective brain
+	if (bAIVsAI || Order == ERDSquadOrder::Storm || Order == ERDSquadOrder::Attack)
 	{
-		if (const ARDBot* EB = Cast<ARDBot>(Enemy))
-		{
-			if (EB->IsRobot() && FVector::Dist(GetActorLocation(), Enemy->GetActorLocation()) < 1200.f)
-			{
-				EngageTactically(Enemy, DeltaSeconds);
-				// Still allow progress if very far west — but never walk into the robot
-				return;
-			}
-		}
+		TickAllyObjectives(DeltaSeconds, Enemy, Isaac, AssaultRally);
+		return;
 	}
 
 	switch (Order)
 	{
 	case ERDSquadOrder::Hold:
-		MoveToward(HoldPoint, DeltaSeconds, 0.8f);
+		MoveToward(HoldPoint, DeltaSeconds, 0.95f);
 		if (Enemy && FVector::Dist(GetActorLocation(), Enemy->GetActorLocation()) < 2200.f)
 		{
 			EngageTactically(Enemy, DeltaSeconds);
 		}
+		AlwaysShootNearbyBreach();
 		break;
-
-	case ERDSquadOrder::Attack:
-		if (Enemy)
-		{
-			EngageTactically(Enemy, DeltaSeconds);
-		}
-		else if (bAIVsAI)
-		{
-			MoveToward(AssaultRally, DeltaSeconds, 1.3f);
-		}
-		else if (Player)
-		{
-			MoveToward(Player->GetActorLocation(), DeltaSeconds, 1.f);
-		}
-		break;
-
-	case ERDSquadOrder::Storm:
-	{
-		// Approach via learned route (airlock / north flank / south flank)
-		const FVector Me = GetActorLocation();
-		const float ApproachGateX = 5600.f;
-		if (Me.X < ApproachGateX)
-		{
-			// Robots lead: humans lag slightly behind friendly robots when possible
-			FVector Way = AssaultRally;
-			if (!bIsRobot)
-			{
-				if (AActor* Tank = FindNearestFriendlyRobot())
-				{
-					const FVector T = Tank->GetActorLocation();
-					// Stay behind the tank relative to base (+X)
-					if (T.X > Me.X - 100.f)
-					{
-						Way = T + FVector(-220.f, (FormationSlot - 1) * 60.f, 0.f);
-					}
-				}
-			}
-			MoveToward(Way, DeltaSeconds, bIsRobot ? 1.55f : 1.35f);
-			if (Enemy && FVector::Dist(Me, Enemy->GetActorLocation()) < 1100.f)
-			{
-				EngageTactically(Enemy, DeltaSeconds);
-			}
-			break;
-		}
-
-		// Classic order of work: door → wreckage → ISAAC
-		// Skirmish only with tactics (no human head-on vs robots)
-		AActor* DoorOrWreck = FindNearestRoomDoor();
-		if (Enemy && FVector::Dist(Me, Enemy->GetActorLocation()) < 850.f)
-		{
-			EngageTactically(Enemy, DeltaSeconds);
-			// Humans that are kiting skip objective push this frame
-			if (!bIsRobot)
-			{
-				if (const ARDBot* EB = Cast<ARDBot>(Enemy))
-				{
-					if (EB->IsRobot()) break;
-				}
-			}
-		}
-		if (DoorOrWreck)
-		{
-			const float D = FVector::Dist(Me, DoorOrWreck->GetActorLocation());
-			// Robots push door; humans support from slightly back if robots alive
-			FVector DoorGoal = DoorOrWreck->GetActorLocation();
-			if (!bIsRobot && FindNearestFriendlyRobot())
-			{
-				DoorGoal += FVector(-180.f, (FormationSlot - 1) * 70.f, 0.f);
-			}
-			if (D > 280.f) MoveToward(DoorGoal, DeltaSeconds, bIsRobot ? 1.45f : 1.25f);
-			TryFireAt(DoorOrWreck);
-			// Point-blank breach: LOS often blocked by door frame / own teammates
-			if (D < 550.f)
-			{
-				if (ARDRoomDoor* Door = Cast<ARDRoomDoor>(DoorOrWreck))
-				{
-					if (!Door->IsBreached() && FireCD <= 0.f)
-					{
-						FireCD = FireInterval * 0.55f;
-						Door->TakeDamageAmount(ShotDamage * (bIsRobot ? 2.0f : 1.5f));
-						if (GetWorld())
-						{
-							const FVector S = Me + FVector(0, 0, 70);
-							const FVector E = Door->GetActorLocation() + FVector(0, 0, 100);
-							RDLaserFX::DrawBeam(GetWorld(), S, E, FColor(80, 255, 120), 16.f, 0.25f);
-							RDLaserFX::PlayZap(GetWorld(), S, true);
-						}
-					}
-				}
-				else if (ARDWreckage* W = Cast<ARDWreckage>(DoorOrWreck))
-				{
-					if (!W->IsCleared() && FireCD <= 0.f)
-					{
-						FireCD = FireInterval * 0.6f;
-						W->TakeDamageAmount(ShotDamage * 1.6f);
-					}
-				}
-			}
-			if (Enemy && D < 900.f) EngageTactically(Enemy, DeltaSeconds);
-		}
-		else if (Isaac)
-		{
-			const float D = FVector::Dist(Me, Isaac->GetActorLocation());
-			if (D > 350.f) MoveToward(Isaac->GetActorLocation(), DeltaSeconds, 1.3f);
-			TryFireAt(Isaac);
-			if (D < 1000.f) TryFireAt(Isaac);
-			if (Enemy && D < 1000.f) EngageTactically(Enemy, DeltaSeconds);
-		}
-		else if (Enemy)
-		{
-			EngageTactically(Enemy, DeltaSeconds);
-		}
-		else if (bAIVsAI)
-		{
-			MoveToward(AssaultRally, DeltaSeconds, 1.4f);
-		}
-		else if (Player)
-		{
-			MoveToward(Player->GetActorLocation(), DeltaSeconds, 1.f);
-		}
-		break;
-	}
 
 	case ERDSquadOrder::Follow:
 	default:
 	{
-		if (bAIVsAI)
-		{
-			if (Enemy) EngageTactically(Enemy, DeltaSeconds);
-			else MoveToward(AssaultRally, DeltaSeconds, 1.5f);
-			break;
-		}
 		if (!Player) return;
-		// Formation offset behind player (works from far Approach LZ across the plain)
-		const FVector Offset(-180.f - FormationSlot * 110.f, (FormationSlot - 1) * 200.f, 0.f);
+		const FVector Offset = GetFormationOffset() + FVector(-120.f, 0.f, 0.f);
 		const FVector FollowPt = Player->GetActorLocation() + Player->GetActorRotation().RotateVector(Offset);
 		const float Dist = FVector::Dist2D(GetActorLocation(), Player->GetActorLocation());
 		if (Dist > 220.f)
 		{
-			// Sprint catch-up across open regolith (LZ can be 100m+ from base)
-			float Scale = 1.15f;
-			if (Dist > 6000.f) Scale = 2.6f;
-			else if (Dist > 3000.f) Scale = 2.2f;
-			else if (Dist > 1200.f) Scale = 1.8f;
-			else if (Dist > 600.f) Scale = 1.45f;
+			float Scale = 1.25f;
+			if (Dist > 6000.f) Scale = 2.8f;
+			else if (Dist > 3000.f) Scale = 2.3f;
+			else if (Dist > 1200.f) Scale = 1.9f;
+			else if (Dist > 600.f) Scale = 1.5f;
 			MoveToward(FollowPt, DeltaSeconds, Scale);
 		}
-		// Shoot while following if enemy close
 		if (Enemy && FVector::Dist(GetActorLocation(), Enemy->GetActorLocation()) < 1800.f)
 		{
 			TryFireAt(Enemy);
 		}
+		AlwaysShootNearbyBreach();
 		break;
 	}
 	}
@@ -1477,7 +2414,11 @@ void ARDBot::Tick(float DeltaSeconds)
 			}
 		}
 	}
-	GetCharacterMovement()->MaxWalkSpeed = MoveSpeed * SpeedMul;
+	if (UCharacterMovementComponent* Move = GetCharacterMovement())
+	{
+		Move->MaxWalkSpeed = MoveSpeed * SpeedMul;
+		Move->MaxFlySpeed = MoveSpeed * SpeedMul;
+	}
 
 	TickStuckRecovery(DeltaSeconds);
 	// Periodic wall-clip repair (cheap — only when not clear)

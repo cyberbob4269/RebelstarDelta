@@ -1,6 +1,9 @@
 // Rebelstar Delta — base build + heavy graphics dress
 
 #include "RDMapBuilder.h"
+#include "NavigationSystem.h"
+#include "NavMesh/NavMeshBoundsVolume.h"
+#include "Components/BrushComponent.h"
 #include "RDDestructible.h"
 #include "RDGameMode.h"
 #include "RDIsaacNode.h"
@@ -113,10 +116,13 @@ AActor* ARDMapBuilder::SpawnShape(UStaticMesh* Mesh, const FVector& WorldLoc, co
 	{
 		SMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 		SMC->SetCollisionProfileName(TEXT("BlockAll"));
+		// Solid geometry must mark nav — required for Recast / MoveTo / FindPath
+		SMC->SetCanEverAffectNavigation(true);
 	}
 	else
 	{
 		SMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		SMC->SetCanEverAffectNavigation(false);
 	}
 	UMaterialInterface* Parent = bUnlit ? UnlitMat.Get() : ShapeMat.Get();
 	if (Parent)
@@ -143,7 +149,7 @@ void ARDMapBuilder::SpawnCeilingTile(const FVector& Cell, float CeilingZ, float 
 }
 
 AActor* ARDMapBuilder::SpawnBox(const FVector& WorldLoc, const FVector& Scale, const FLinearColor& Color,
-	bool bCollision, bool bBreach, bool bUnlit)
+	bool bCollision, bool bBreach, bool bUnlit, bool bBlockPawns)
 {
 	if (!GetWorld() || !CubeMesh) return nullptr;
 	AStaticMeshActor* Actor = GetWorld()->SpawnActor<AStaticMeshActor>(WorldLoc, FRotator::ZeroRotator);
@@ -158,8 +164,25 @@ AActor* ARDMapBuilder::SpawnBox(const FVector& WorldLoc, const FVector& Scale, c
 	{
 		SMC->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 		SMC->SetCollisionProfileName(TEXT("BlockAll"));
-		// Tall thin props (walls) block pawns; very flat high pieces treated as roof décor
-		// already use bCollision=false. Wall tops remain solid — floor-snap avoids them.
+		if (!bBlockPawns)
+		{
+			// Décor clutter (brick stacks, poles, chevrons): stop lasers optionally, never snag AI
+			SMC->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
+			SMC->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+			// Thin flat road marks / solar: also ignore Visibility so path LOS is not fake-walled
+			const bool bFlatDecor = Scale.Z < 0.35f;
+			if (bFlatDecor)
+			{
+				SMC->SetCollisionResponseToChannel(ECC_Visibility, ECR_Ignore);
+			}
+			SMC->SetCanEverAffectNavigation(false); // clutter must not punch holes in nav
+			Actor->Tags.Add(FName(TEXT("RD_Clutter")));
+		}
+		else
+		{
+			// Real walls / floors for Recast
+			SMC->SetCanEverAffectNavigation(true);
+		}
 	}
 	else
 	{
@@ -478,6 +501,9 @@ void ARDMapBuilder::SpawnConstructionYard(const FVector& Anchor)
 	const FLinearColor Solar(0.12f, 0.18f, 0.55f);
 	const FLinearColor SolarHi(0.25f, 0.4f, 0.9f);
 
+	// Brick stacks / solar / digger = visual clutter — do NOT block pawn AI (was the main snag trap)
+	const bool bCol = true;
+	const bool bPawns = false;
 	for (int32 z = 0; z < 5; ++z)
 	{
 		for (int32 x = 0; x < 9; ++x)
@@ -486,7 +512,7 @@ void ARDMapBuilder::SpawnConstructionYard(const FVector& Anchor)
 			{
 				if (z > 2 && x > 5) continue;
 				SpawnBox(Anchor + FVector(x * 125.f, y * 95.f, z * 100.f + 55.f),
-					FVector(1.15f, 0.7f, 0.9f), (x + y + z) % 2 ? Brick : BrickDark, true);
+					FVector(1.15f, 0.7f, 0.9f), (x + y + z) % 2 ? Brick : BrickDark, bCol, false, false, bPawns);
 			}
 		}
 	}
@@ -494,18 +520,18 @@ void ARDMapBuilder::SpawnConstructionYard(const FVector& Anchor)
 	{
 		const float H = (i < 8) ? 3.5f : (i < 11 ? 2.2f : 1.0f);
 		SpawnBox(Anchor + FVector(-350.f, 100.f + i * 145.f, H * 50.f),
-			FVector(1.0f, 1.35f, H), Brick, true);
+			FVector(1.0f, 1.35f, H), Brick, bCol, false, false, bPawns);
 	}
 	// Digger
-	SpawnBox(Anchor + FVector(1200.f, 700.f, 120.f), FVector(3.8f, 2.2f, 1.7f), Yellow, true);
-	SpawnBox(Anchor + FVector(1550.f, 850.f, 95.f), FVector(2.8f, 0.55f, 0.5f), Yellow, true);
-	SpawnBox(Anchor + FVector(1750.f, 900.f, 70.f), FVector(0.8f, 1.2f, 0.9f), FLinearColor(0.3f, 0.3f, 0.28f), true);
+	SpawnBox(Anchor + FVector(1200.f, 700.f, 120.f), FVector(3.8f, 2.2f, 1.7f), Yellow, bCol, false, false, bPawns);
+	SpawnBox(Anchor + FVector(1550.f, 850.f, 95.f), FVector(2.8f, 0.55f, 0.5f), Yellow, bCol, false, false, bPawns);
+	SpawnBox(Anchor + FVector(1750.f, 900.f, 70.f), FVector(0.8f, 1.2f, 0.9f), FLinearColor(0.3f, 0.3f, 0.28f), bCol, false, false, bPawns);
 	// Solar farm
 	for (int32 i = 0; i < 10; ++i)
 	{
-		SpawnBox(Anchor + FVector(80.f + i * 190.f, -550.f, 55.f), FVector(1.7f, 1.5f, 0.1f), Solar, true);
+		SpawnBox(Anchor + FVector(80.f + i * 190.f, -550.f, 55.f), FVector(1.7f, 1.5f, 0.1f), Solar, bCol, false, false, bPawns);
 		SpawnBox(Anchor + FVector(80.f + i * 190.f, -550.f, 62.f), FVector(1.5f, 1.3f, 0.05f), SolarHi, false, false, true);
-		SpawnBox(Anchor + FVector(80.f + i * 190.f, -550.f, 25.f), FVector(0.18f, 0.18f, 0.55f), FLinearColor(0.35f, 0.35f, 0.38f), true);
+		SpawnBox(Anchor + FVector(80.f + i * 190.f, -550.f, 25.f), FVector(0.18f, 0.18f, 0.55f), FLinearColor(0.35f, 0.35f, 0.38f), bCol, false, false, bPawns);
 	}
 	SpawnInteriorLight(Anchor + FVector(700.f, 300.f, 450.f), FLinearColor(1.f, 0.88f, 0.5f), 30000.f, 3500.f);
 	SpawnInteriorLight(Anchor + FVector(200.f, 900.f, 380.f), FLinearColor(1.f, 0.8f, 0.4f), 20000.f, 2800.f);
@@ -521,20 +547,21 @@ void ARDMapBuilder::SpawnApproachLZ(const FVector& LZ, const FVector& AirlockMou
 	const FLinearColor LightPole(0.35f, 0.36f, 0.4f);
 
 	// Landing disc — thin floor only (no tall volumes that can trap the player)
-	SpawnBox(LZ + FVector(0.f, 0.f, 4.f), FVector(22.f, 22.f, 0.12f), Pad, true);
-	SpawnBox(LZ + FVector(0.f, 0.f, 12.f), FVector(20.f, 20.f, 0.08f), PadEdge, true);
+	// Floors block pawns (need something under feet for aesthetics only — movement is free Z clamp)
+	SpawnBox(LZ + FVector(0.f, 0.f, 4.f), FVector(22.f, 22.f, 0.12f), Pad, true, false, false, false);
+	SpawnBox(LZ + FVector(0.f, 0.f, 12.f), FVector(20.f, 20.f, 0.08f), PadEdge, true, false, false, false);
 	// Yellow ring + H mark (no collision — visual only)
 	SpawnBox(LZ + FVector(0.f, 0.f, 16.f), FVector(17.f, 17.f, 0.06f), Yel, false, false, true);
 	SpawnBox(LZ + FVector(0.f, 0.f, 18.f), FVector(0.35f, 3.5f, 0.08f), YelGlow, false, false, true);
 	SpawnBox(LZ + FVector(0.f, 0.f, 18.f), FVector(2.8f, 0.35f, 0.08f), YelGlow, false, false, true);
 
-	// Perimeter poles
+	// Perimeter poles — visual only for AI (thin poles snagged everyone)
 	for (int32 i = 0; i < 8; ++i)
 	{
 		const float A = i * 45.f;
 		const float Rad = FMath::DegreesToRadians(A);
 		const FVector P = LZ + FVector(FMath::Cos(Rad) * 900.f, FMath::Sin(Rad) * 900.f, 0.f);
-		SpawnBox(P + FVector(0.f, 0.f, 200.f), FVector(0.25f, 0.25f, 4.f), LightPole, true);
+		SpawnBox(P + FVector(0.f, 0.f, 200.f), FVector(0.25f, 0.25f, 4.f), LightPole, true, false, false, false);
 		SpawnBox(P + FVector(0.f, 0.f, 420.f), FVector(0.5f, 0.5f, 0.3f), YelGlow, false, false, true);
 		SpawnInteriorLight(P + FVector(0.f, 0.f, 400.f), FLinearColor(1.f, 0.95f, 0.8f), 20000.f, 2500.f);
 	}
@@ -552,11 +579,11 @@ void ARDMapBuilder::SpawnApproachLZ(const FVector& LZ, const FVector& AirlockMou
 		const FVector Pt = FMath::Lerp(LZ, AirlockMouth, T);
 		const bool bEven = (i % 2) == 0;
 		SpawnBox(Pt + FVector(0.f, 0.f, 12.f), FVector(1.2f, 2.8f, 0.1f),
-			bEven ? Yel : FLinearColor(0.9f, 0.25f, 0.1f), true);
+			bEven ? Yel : FLinearColor(0.9f, 0.25f, 0.1f), true, false, false, false);
 		if ((i % 3) == 0)
 		{
 			const FVector Side = FVector(-Dir.Y, Dir.X, 0.f) * 380.f;
-			SpawnBox(Pt + Side + FVector(0.f, 0.f, 160.f), FVector(0.22f, 0.22f, 3.2f), LightPole, true);
+			SpawnBox(Pt + Side + FVector(0.f, 0.f, 160.f), FVector(0.22f, 0.22f, 3.2f), LightPole, true, false, false, false);
 			SpawnBox(Pt + Side + FVector(0.f, 0.f, 340.f), FVector(0.45f, 0.45f, 0.25f), YelGlow, false, false, true);
 		}
 	}
@@ -575,11 +602,11 @@ void ARDMapBuilder::SpawnExteriorDressing(const FVector& AirlockCenter, float CS
 	const FLinearColor SolarHi(0.28f, 0.45f, 0.95f);
 	const FLinearColor Yel(0.95f, 0.75f, 0.12f);
 
-	// Approach floodlights (runway into airlock)
+	// Approach floodlights (runway into airlock) — poles never snag AI
 	for (int32 i = 0; i < 8; ++i)
 	{
 		const FVector Pole = AirlockCenter + FVector(-600.f - i * 380.f, (i % 2 ? 1.f : -1.f) * 420.f, 0.f);
-		SpawnBox(Pole + FVector(0.f, 0.f, 220.f), FVector(0.28f, 0.28f, 4.4f), FLinearColor(0.35f, 0.36f, 0.4f), true);
+		SpawnBox(Pole + FVector(0.f, 0.f, 220.f), FVector(0.28f, 0.28f, 4.4f), FLinearColor(0.35f, 0.36f, 0.4f), true, false, false, false);
 		SpawnBox(Pole + FVector(40.f, 0.f, 450.f), FVector(0.9f, 0.55f, 0.35f), FLinearColor(1.f, 0.95f, 0.85f), false, false, true);
 		SpawnInteriorLight(Pole + FVector(60.f, 0.f, 440.f), FLinearColor(1.f, 0.95f, 0.88f), 35000.f, 3200.f);
 	}
@@ -588,33 +615,33 @@ void ARDMapBuilder::SpawnExteriorDressing(const FVector& AirlockCenter, float CS
 	for (int32 i = 0; i < 12; ++i)
 	{
 		const FVector B = AirlockCenter + FVector(-200.f - i * 250.f, (i % 2 ? 180.f : -180.f), 15.f);
-		SpawnBox(B, FVector(0.35f, 0.35f, 0.2f), FLinearColor(1.f, 0.2f, 0.1f), true);
+		SpawnBox(B, FVector(0.35f, 0.35f, 0.2f), FLinearColor(1.f, 0.2f, 0.1f), true, false, false, false);
 		SpawnBox(B + FVector(0.f, 0.f, 25.f), FVector(0.2f, 0.2f, 0.2f), FLinearColor(1.f, 0.35f, 0.15f), false, false, true);
 	}
 
-	// Regolith berms shielding airlock approach (Artemis / ISRU mood)
+	// Regolith berms / fake habitats — set dressing, not solid AI walls
 	for (int32 i = 0; i < 6; ++i)
 	{
 		const float Side = (i % 2 == 0) ? 1.f : -1.f;
 		SpawnBox(AirlockCenter + FVector(-400.f - i * 220.f, Side * (520.f + i * 40.f), 60.f),
-			FVector(3.5f, 2.2f, 1.2f + i * 0.15f), (i % 2) ? Regolith : RegDark, true);
+			FVector(3.5f, 2.2f, 1.2f + i * 0.15f), (i % 2) ? Regolith : RegDark, true, false, false, false);
 	}
 
-	// Modular habitat cylinders flanking west face (Foundation-style)
+	// Modular habitat cylinders flanking west face (Foundation-style) — visual only for pathing
 	for (int32 i = 0; i < 3; ++i)
 	{
 		const float Side = (i == 1) ? 0.f : (i == 0 ? -1.f : 1.f);
 		const FVector Hab = AirlockCenter + FVector(200.f + i * 80.f, Side * 900.f, 0.f);
-		SpawnBox(Hab + FVector(0.f, 0.f, 140.f), FVector(5.5f, 3.2f, 2.6f), Hull, true);
-		SpawnBox(Hab + FVector(0.f, 0.f, 280.f), FVector(5.2f, 3.0f, 0.35f), HullDark, true);
+		SpawnBox(Hab + FVector(0.f, 0.f, 140.f), FVector(5.5f, 3.2f, 2.6f), Hull, true, false, false, false);
+		SpawnBox(Hab + FVector(0.f, 0.f, 280.f), FVector(5.2f, 3.0f, 0.35f), HullDark, true, false, false, false);
 		// Window strip
 		SpawnBox(Hab + FVector(-280.f, 0.f, 160.f), FVector(0.15f, 2.4f, 0.7f),
 			FLinearColor(0.4f, 0.65f, 0.9f), false, false, true);
-		SpawnBox(Hab + FVector(0.f, 0.f, 40.f), FVector(5.8f, 3.4f, 0.4f), RegDark, true);
+		SpawnBox(Hab + FVector(0.f, 0.f, 40.f), FVector(5.8f, 3.4f, 0.4f), RegDark, true, false, false, false);
 		// Connecting tube toward base
 		if (i < 2)
 		{
-			SpawnBox(Hab + FVector(350.f, -Side * 200.f, 120.f), FVector(3.5f, 1.2f, 1.4f), HullDark, true);
+			SpawnBox(Hab + FVector(350.f, -Side * 200.f, 120.f), FVector(3.5f, 1.2f, 1.4f), HullDark, true, false, false, false);
 		}
 	}
 
@@ -1047,6 +1074,55 @@ void ARDMapBuilder::BuildBase()
 		SpawnIsaacRoomDoor(Cell, CS);
 	}
 
+	// Engine nav after procedural geometry (standard UE stack: bounds → Recast → path queries)
+	EnsureNavMesh();
+
 	UE_LOG(LogTemp, Log, TEXT("[RebelstarDelta] Base %dx%d ISAAC=%d airlock@row=%d wallCol=%d isaacDoor=(%d,%d)"),
 		W, H, IsaacCount, EntranceY, EntranceWallX, IsaacDoorX, IsaacDoorY);
+}
+
+void ARDMapBuilder::EnsureNavMesh()
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	// Cover approach LZ (−9k) through far east of base (~16k) and full map Y span
+	// Default bounds brush ~200uu; Scale (140,55,4) ≈ world half-extents 14k / 5.5k / 400
+	const FVector Center(3500.f, -5850.f, 200.f);
+
+	// Remove previous bounds from earlier BuildBase
+	TArray<AActor*> Existing;
+	UGameplayStatics::GetAllActorsOfClass(World, ANavMeshBoundsVolume::StaticClass(), Existing);
+	for (AActor* A : Existing)
+	{
+		if (A && A->Tags.Contains(FName(TEXT("RD_Base"))))
+		{
+			A->Destroy();
+		}
+	}
+
+	FActorSpawnParameters SP;
+	SP.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	ANavMeshBoundsVolume* Vol = World->SpawnActor<ANavMeshBoundsVolume>(Center, FRotator::ZeroRotator, SP);
+	if (Vol)
+	{
+		Vol->Tags.Add(FName(TEXT("RD_Base")));
+		Vol->SetActorScale3D(FVector(140.f, 55.f, 4.f));
+		if (UBrushComponent* Brush = Vol->GetBrushComponent())
+		{
+			Brush->SetMobility(EComponentMobility::Movable);
+		}
+		UE_LOG(LogTemp, Log, TEXT("[RebelstarDelta] NavMeshBoundsVolume at %s scale (140,55,4)"), *Center.ToCompactString());
+	}
+
+	if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World))
+	{
+		// Rebuild so FindPath / future AI MoveTo see greybox walls
+		NavSys->Build();
+		UE_LOG(LogTemp, Log, TEXT("[RebelstarDelta] NavigationSystem::Build() after greybox spawn"));
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[RebelstarDelta] No NavigationSystem — bots fall back to landmark paths"));
+	}
 }

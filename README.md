@@ -2,7 +2,8 @@
 
 UE **5.8** C++ moonbase assault — Fable 5 / Rebelstar-style tactics in 3D.
 
-**Default mode:** AI-vs-AI spectator loop (US assault vs UK defence), open roofs, tactical learning, close-run rosters.
+**Default mode:** AI-vs-AI **continuous** spectator training (US vs UK), open roofs, tactical learning, close-run rosters.  
+`TargetTrainingRounds = 0` → unlimited rematch soak for data collection.
 
 ## Teams (balanced ~6v7)
 
@@ -16,32 +17,43 @@ Auto-balance nudges counts if one side wins a series by 2+.
 ## Features
 
 - Humanoid **spacesuits** + US/UK chest **flag badges**
+- **Assault objectives:** doors → sealed panels → **ISAAC** → enemy
 - **Tactical learning:** airlock / north flank / south flank · UK hold / rush / split
 - **Humans never charge robots head-on** (kite; mechs tank)
-- Wall-safe movement (sweep collision) + unclip
-- Fat **laser beams** + procedural **laser zap** audio
-- Training series logs: `Saved/AgentVision/training_series.csv`
+- Nav path + landmark fallback, RVO, formation wedge, anti-snag clutter
+- Smooth Trump follow-cam (succession) + fat lasers / zap SFX
+- **Training pipeline:** CSV + JSON every round
 
 ## Open
 
 ```
 C:\UE\RebelstarDelta\RebelstarDelta.uproject
+# or: pwsh -File scripts\open_editor.ps1
 ```
 
-Map / game mode is set in project defaults. Press **Play** for AI spectator orbit.
+Press **Play** — continuous AI spectator assault.
 
-## Data
+## Data / handoff
 
-- Logic map: `Content/Data/MoonbaseDelta.logic.txt`
-- Docs: `Docs/`
+| Path | Why |
+|------|-----|
+| `Content/Data/Training/` | Durable series CSV + latest JSON |
+| `Saved/AgentVision/` | Live logs + battle reports |
+| `Docs/FUTURE_SELF.md` | Next-agent briefing |
+| `Docs/AI_STACK.md` | UE NavMesh / RVO / what we use |
+| `Content/Data/AGENT_NOTES.md` | Short agent card |
+
+```powershell
+pwsh -File scripts\export_training_snapshot.ps1
+```
 
 ## Build
 
-UE 5.8 + Live Coding (Ctrl+Alt+F11) or:
-
-```bat
-Build.bat RebelstarDeltaEditor Win64 Development -Project="...\RebelstarDelta.uproject"
+```powershell
+pwsh -File scripts\rebuild_game_module.ps1
 ```
+
+Live Coding blocks UBT → close editor first.
 
 ## License / notes
 

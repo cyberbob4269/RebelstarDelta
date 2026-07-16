@@ -153,20 +153,63 @@ public:
 	/** Apply learned combat multipliers from battle self-improve. */
 	void ApplyLearningBoost(float SpeedMul, float DamageMul, float FireRateMul);
 
+	/** Unique squad index 0..N (set at spawn — do not use UniqueID % 3). */
+	void SetFormationSlot(int32 Slot);
+	int32 GetFormationSlot() const { return FormationSlot; }
+
+	/**
+	 * Tactical wedge offset facing +X (toward base):
+	 * point / left-right wings / far flanks / rear — keeps squad spread.
+	 */
+	FVector GetFormationOffset() const;
+
+	/** Preferred world Y lane for this slot (absolute offset from -5850). */
+	float GetFormationLaneY() const;
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaSeconds) override;
 
 	void MoveToward(const FVector& WorldTarget, float DeltaSeconds, float SpeedScale = 1.f);
 	void TickAlly(float DeltaSeconds);
+	void TickAllyStormAssault(float DeltaSeconds, AActor* Enemy, AActor* Isaac, const FVector& AssaultRally);
+	/**
+	 * Assault objective order (AI-vs-AI / Storm):
+	 * 1) Survive close enemy  2) Breach doors/%  3) Destroy ISAAC  4) Hunt remaining UK
+	 */
+	void TickAllyObjectives(float DeltaSeconds, AActor* Enemy, AActor* Isaac, const FVector& AssaultRally);
 	void TickDefender(float DeltaSeconds);
 	void TickDoorGuard(float DeltaSeconds);
 	void TickStuckRecovery(float DeltaSeconds);
 	/** True if capsule is not embedded in wall solid. */
 	bool IsLocationClear(const FVector& TestLoc) const;
+	/** Capsule walkability from A→B (ignores pawns; walls block). */
+	bool HasWalkableLOS(const FVector& From, const FVector& To) const;
+	/** Rebuild sticky multi-waypoint path to goal (landmarks + side detours). */
+	void RebuildPathTo(const FVector& Goal);
+	/** Current path step, or Goal if empty. */
+	FVector GetPathFollowPoint(const FVector& Goal) const;
+	/** Moonbase landmarks for routing through airlock / flanks. */
+	void CollectPathLandmarks(TArray<FVector>& Out) const;
+	/** Side-offset corners when a segment is wall-blocked. */
+	bool TryAppendDetour(const FVector& A, const FVector& B, TArray<FVector>& OutPath) const;
 	/** If inside wall mesh, push to nearest free space (sweep-safe). */
 	void ResolveWallPenetration();
+	/** Pick free walk direction toward goal (local obstacle fan). */
+	FVector FindBestSteerDir(const FVector& DesiredDir, float LookAhead) const;
+	/** Bash nearest clutter / door when wedged against it. */
+	void BashNearestObstacle();
+	/** Push away from nearby allies (doorway jam / stacking). */
+	FVector ComputeSeparation() const;
+	/** Staging hold west of a choke — unique per slot so the pack does not stack. */
+	FVector GetChokeStagingPoint(const FVector& ChokeLoc, float BackDist = 450.f) const;
+	/** True if another ally is closer to choke and we should wait. */
+	bool ShouldYieldAtChoke(const FVector& ChokeLoc, float Radius = 420.f) const;
 	void TryFireAt(AActor* Target);
+	/** Blast door/wreck/breach prop (ignores perfect LOS when very close). */
+	void TryBreachTarget(AActor* Target, float DamageMul = 1.f);
+	/** US attackers: if near a door/wreck/sealed panel, always fire on it. */
+	void AlwaysShootNearbyBreach();
 	void RefreshLook();
 	void Die();
 	void BuildSuit();
@@ -180,6 +223,9 @@ protected:
 	AActor* FindNearestIsaac() const;
 	AActor* FindNearestRoomDoor() const;
 	AActor* FindNearestFriendlyRobot() const;
+	/** Sealed % panels / breachable scenery in path. */
+	AActor* FindNearestBreachable() const;
+	int32 CountAlliesNear(const FVector& Loc, float Radius) const;
 
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<UStaticMeshComponent> Torso;
@@ -264,4 +310,15 @@ protected:
 	float UnstickT = 0.f;
 	FVector UnstickDir = FVector::ForwardVector;
 	int32 StuckEvents = 0;
+
+	// Sticky multi-waypoint path (no NavMesh required — works on greybox map)
+	TArray<FVector> PathWaypoints;
+	int32 PathIndex = 0;
+	FVector PathGoal = FVector::ZeroVector;
+	float PathRebuildT = 0.f;
+	int32 PathFailStreak = 0;
+	float PreferDetourSign = 1.f;
+	/** Damped walk heading — stops frame-to-frame steer thrash / visual hopping. */
+	FVector SmoothMoveDir = FVector(1.f, 0.f, 0.f);
+	bool bSmoothMoveInit = false;
 };
