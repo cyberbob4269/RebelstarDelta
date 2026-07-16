@@ -627,12 +627,17 @@ void ARDGameMode::SetupSpectatorCamera()
 	if (!Pawn) return;
 
 	Pawn->Tags.AddUnique(FName(TEXT("RD_Spectator")));
-	// Front of base = WEST airlock facade. Camera sits west looking east into the fight.
-	const FVector CamLoc(1200.f, -5850.f, 2400.f);
-	const FVector LookAt(7500.f, -5850.f, 200.f); // airlock mouth + first corridors
-	Pawn->SetActorLocation(CamLoc, false, nullptr, ETeleportType::TeleportPhysics);
-	PC->SetControlRotation((LookAt - CamLoc).Rotation());
+	SpectatorSubject = nullptr;
+	LastSpectatorSubjectName.Reset();
+	bSpecCamInitialized = false;
 	SpecOrbitYaw = 0.f;
+
+	// Seed camera behind Trump (or LZ) looking toward the base front
+	const FVector SeedSubject(-9000.f, -5850.f, 120.f);
+	SpecLookAt = SeedSubject + FVector(1200.f, 0.f, 80.f);
+	SpecCamLoc = SeedSubject + FVector(-900.f, -420.f, 520.f);
+	Pawn->SetActorLocation(SpecCamLoc, false, nullptr, ETeleportType::TeleportPhysics);
+	PC->SetControlRotation((SpecLookAt - SpecCamLoc).Rotation());
 
 	if (ACharacter* Ch = Cast<ACharacter>(Pawn))
 	{
@@ -663,61 +668,144 @@ void ARDGameMode::SetupSpectatorCamera()
 	{
 		Leader->SetSpectatorInvulnerable(true);
 	}
-	UE_LOG(LogTemp, Log, TEXT("[RebelstarDelta] Spectator FRONT cam @ %s → airlock"), *CamLoc.ToCompactString());
+	// Resolve Trump after spawn list exists
+	if (ARDBot* Sub = ResolveSpectatorSubject())
+	{
+		SpectatorSubject = Sub;
+		LastSpectatorSubjectName = Sub->UnitName;
+		StatusNote(FString::Printf(TEXT("CAM: following %s"), *Sub->UnitName));
+	}
+	UE_LOG(LogTemp, Log, TEXT("[RebelstarDelta] Spectator follow-cam (Trump first) armed"));
+}
+
+ARDBot* ARDGameMode::ResolveSpectatorSubject()
+{
+	// Succession: Trump → named humans → other humans → robots
+	static const TCHAR* Priority[] = {
+		TEXT("Trump"), TEXT("Vance"), TEXT("Rubio"), TEXT("Haley"), TEXT("Cruz"), TEXT("Scott"),
+		TEXT("APEX-1"), TEXT("EAGLE-9"), TEXT("PATRIOT-3"), TEXT("HAWK-4"),
+	};
+
+	TArray<AActor*> Bots;
+	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDBot::StaticClass(), Bots);
+
+	auto FindByName = [&](const FString& Name) -> ARDBot*
+	{
+		for (AActor* A : Bots)
+		{
+			ARDBot* B = Cast<ARDBot>(A);
+			if (!B || B->IsDead() || B->Team != ERDBotTeam::Ally) continue;
+			if (B->UnitName.Equals(Name, ESearchCase::IgnoreCase)) return B;
+		}
+		return nullptr;
+	};
+
+	// Keep current subject if still alive
+	if (IsValid(SpectatorSubject) && !SpectatorSubject->IsDead()
+		&& SpectatorSubject->Team == ERDBotTeam::Ally)
+	{
+		return SpectatorSubject.Get();
+	}
+
+	for (const TCHAR* Name : Priority)
+	{
+		if (ARDBot* B = FindByName(Name)) return B;
+	}
+	// Any living US unit
+	for (AActor* A : Bots)
+	{
+		ARDBot* B = Cast<ARDBot>(A);
+		if (B && !B->IsDead() && B->Team == ERDBotTeam::Ally) return B;
+	}
+	return nullptr;
 }
 
 void ARDGameMode::TickSpectatorCamera(float DeltaSeconds)
 {
-	if (!bAIVsAIMode || bMatchOver) return;
+	if (!bAIVsAIMode) return;
+	// Keep following during short rematch scoreboard
 	APlayerController* PC = UGameplayStatics::GetPlayerController(this, 0);
 	if (!PC) return;
 	APawn* Pawn = PC->GetPawn();
 	if (!Pawn) return;
 
-	// Hold a WEST→EAST “front of base” angle (airlock is the action).
-	// Gentle sway/dolly so the shot stays alive without spinning behind the base.
 	SpecOrbitYaw += DeltaSeconds;
 
-	// Focus: airlock / west halls (combat approach). Nudge toward live units near the front.
-	FVector Focus(7000.f, -5850.f, 180.f);
-	int32 N = 0;
-	FVector Sum = FVector::ZeroVector;
-	TArray<AActor*> Bots;
-	UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDBot::StaticClass(), Bots);
-	for (AActor* A : Bots)
+	ARDBot* Sub = ResolveSpectatorSubject();
+	if (Sub && Sub != SpectatorSubject.Get())
 	{
-		const ARDBot* B = Cast<ARDBot>(A);
-		if (!B || B->IsDead()) continue;
-		const FVector L = B->GetActorLocation();
-		// Only units near the western front / approach (not deep east ISAAC corner only)
-		if (L.X > -2000.f && L.X < 16000.f)
+		const FString Prev = LastSpectatorSubjectName;
+		SpectatorSubject = Sub;
+		LastSpectatorSubjectName = Sub->UnitName;
+		if (!Prev.IsEmpty() && Prev != Sub->UnitName)
 		{
-			Sum += L;
-			++N;
+			StatusNote(FString::Printf(TEXT("CAM: %s down — now following %s"), *Prev, *Sub->UnitName));
+			UE_LOG(LogTemp, Warning, TEXT("[RebelstarDelta] Spectator succession %s → %s"), *Prev, *Sub->UnitName);
 		}
 	}
-	if (N > 0)
+	else if (Sub)
 	{
-		const FVector Combat = Sum / float(N);
-		// Bias look toward combat but keep focus on front facade
-		Focus = FMath::Lerp(Focus, FVector(Combat.X, Combat.Y, 160.f), 0.55f);
-		Focus.X = FMath::Clamp(Focus.X, 4500.f, 12000.f);
-		Focus.Y = FMath::Clamp(Focus.Y, -8500.f, -2500.f);
+		SpectatorSubject = Sub;
+		LastSpectatorSubjectName = Sub->UnitName;
 	}
 
-	const float SwayY = FMath::Sin(SpecOrbitYaw * 0.28f) * 900.f;
-	const float DollyX = FMath::Sin(SpecOrbitYaw * 0.18f) * 500.f;
-	const float BobZ = FMath::Sin(SpecOrbitYaw * 0.4f) * 180.f;
+	// Subject position (fallback: airlock approach)
+	FVector SubjectLoc(-9000.f, -5850.f, 120.f);
+	FVector SubjectFwd = FVector(1.f, 0.f, 0.f); // toward base
+	if (IsValid(Sub) && !Sub->IsDead())
+	{
+		SubjectLoc = Sub->GetActorLocation();
+		SubjectFwd = Sub->GetActorForwardVector();
+		SubjectFwd.Z = 0.f;
+		if (SubjectFwd.IsNearlyZero()) SubjectFwd = FVector(1.f, 0.f, 0.f);
+		else SubjectFwd.Normalize();
+	}
 
-	// Camera stays WEST of the wall (~X 5200), looking EAST at the front
-	const FVector CamLoc(
-		FMath::Clamp(800.f + DollyX, -500.f, 3200.f),
-		Focus.Y + SwayY * 0.35f - 200.f,
-		FMath::Clamp(2200.f + BobZ + (Focus.X - 5000.f) * 0.05f, 1600.f, 3600.f));
+	// Look a bit ahead of the hero (toward base / their aim) so action is in frame
+	FVector Ahead = SubjectLoc + SubjectFwd * 900.f + FVector(0.f, 0.f, 80.f);
+	// Also bias look toward nearest enemy so fights read clearly
+	if (IsValid(Sub))
+	{
+		TArray<AActor*> Bots;
+		UGameplayStatics::GetAllActorsOfClass(GetWorld(), ARDBot::StaticClass(), Bots);
+		float BestD = 2800.f;
+		for (AActor* A : Bots)
+		{
+			const ARDBot* E = Cast<ARDBot>(A);
+			if (!E || E->IsDead() || E->Team != ERDBotTeam::Defender) continue;
+			const float D = FVector::Dist(SubjectLoc, E->GetActorLocation());
+			if (D < BestD)
+			{
+				BestD = D;
+				Ahead = FMath::Lerp(Ahead, E->GetActorLocation() + FVector(0.f, 0.f, 70.f), 0.65f);
+			}
+		}
+	}
 
-	Pawn->SetActorLocation(CamLoc, false, nullptr, ETeleportType::TeleportPhysics);
-	const FRotator LookRot = (Focus + FVector(0.f, 0.f, 80.f) - CamLoc).Rotation();
-	PC->SetControlRotation(LookRot);
+	// Camera: over-the-shoulder behind hero, slightly elevated, facing action / base
+	const FVector Right = FVector::CrossProduct(SubjectFwd, FVector::UpVector).GetSafeNormal();
+	const float Shoulder = 280.f + 40.f * FMath::Sin(SpecOrbitYaw * 0.7f);
+	const float Back = 720.f + 60.f * FMath::Sin(SpecOrbitYaw * 0.35f);
+	const float Height = 380.f + 40.f * FMath::Sin(SpecOrbitYaw * 0.5f);
+	const FVector DesiredCam = SubjectLoc - SubjectFwd * Back + Right * Shoulder + FVector(0.f, 0.f, Height);
+	const FVector DesiredLook = Ahead;
+
+	if (!bSpecCamInitialized)
+	{
+		SpecCamLoc = DesiredCam;
+		SpecLookAt = DesiredLook;
+		bSpecCamInitialized = true;
+	}
+	else
+	{
+		const float CamSpeed = 6.5f;
+		const float LookSpeed = 8.f;
+		SpecCamLoc = FMath::VInterpTo(SpecCamLoc, DesiredCam, DeltaSeconds, CamSpeed);
+		SpecLookAt = FMath::VInterpTo(SpecLookAt, DesiredLook, DeltaSeconds, LookSpeed);
+	}
+
+	Pawn->SetActorLocation(SpecCamLoc, false, nullptr, ETeleportType::TeleportPhysics);
+	PC->SetControlRotation((SpecLookAt - SpecCamLoc).Rotation());
 }
 
 void ARDGameMode::TickBattleMonitor(float DeltaSeconds)
@@ -798,6 +886,9 @@ void ARDGameMode::RestartMatch()
 	LastAliveAllies = -1;
 	LastAliveDefs = -1;
 	PeakAllyX = -9000.f;
+	SpectatorSubject = nullptr;
+	LastSpectatorSubjectName.Reset();
+	bSpecCamInitialized = false;
 	IsaacNodes.Reset();
 	IsaacDoor = nullptr;
 	DoorGuardBot = nullptr;

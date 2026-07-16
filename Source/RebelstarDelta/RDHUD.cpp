@@ -71,7 +71,9 @@ void ARDHUD::DrawHUD()
 
 	if (GM && GM->IsAIVsAIMode() && !GM->IsMatchOver())
 	{
-		Line4 = FString::Printf(TEXT("US(TRUMP) %d k%d   vs   UK %d k%d   R%d  W %d-%d"),
+		FString CamName = TEXT("TRUMP");
+		// Status often carries "CAM: following X" after succession; keep roster line clear
+		Line4 = FString::Printf(TEXT("US %d k%d  vs  UK %d k%d   R%d  W %d-%d   CAM follows succession"),
 			GM->GetAliveAllies(), GM->GetAttackerKills(),
 			GM->GetAliveDefenders(), GM->GetDefenderKills(),
 			GM->GetRoundIndex(),

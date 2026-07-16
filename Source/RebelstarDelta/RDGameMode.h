@@ -224,6 +224,8 @@ protected:
 	void EndMatch(bool bWin, const FString& Message);
 	void SetupSpectatorCamera();
 	void TickSpectatorCamera(float DeltaSeconds);
+	/** Prefer Trump; if dead, next living US attacker in succession order. */
+	ARDBot* ResolveSpectatorSubject();
 	void TickBattleMonitor(float DeltaSeconds);
 	void RestartMatch();
 	void CountTeams(int32& OutAllies, int32& OutDefenders) const;
@@ -268,6 +270,13 @@ protected:
 	float RematchTimer = -1.f;
 	float MonitorLogTimer = 0.f;
 	float SpecOrbitYaw = 0.f;
+	/** Smooth camera follow of current US hero. */
+	FVector SpecCamLoc = FVector::ZeroVector;
+	FVector SpecLookAt = FVector::ZeroVector;
+	bool bSpecCamInitialized = false;
+	UPROPERTY()
+	TObjectPtr<ARDBot> SpectatorSubject;
+	FString LastSpectatorSubjectName;
 	int32 RoundIndex = 1;
 	int32 AttackerKills = 0;
 	int32 DefenderKills = 0;
